@@ -1,0 +1,41 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Generated model artifacts and temporary files
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.ckpt
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.tmp
+*.temp
+*.log
+
+# Packaging and test/build output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# OS metadata
+.DS_Store
+Thumbs.db
