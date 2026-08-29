@@ -4,6 +4,18 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+print("Using device:", device)
+
+if torch.cuda.is_available():
+    print(
+        "GPU:",
+        torch.cuda.get_device_name(0)
+    )
+
 from .dataset import (
     BinaryToTextDataset,
     collate_fn,
@@ -30,9 +42,9 @@ MAX_CIPHER_LENGTH = 4096
 
 VOCAB_SIZE = 8000
 
-D_MODEL = 128
-NUM_HEADS = 4
-D_FF = 512
+D_MODEL = 256
+NUM_HEADS = 8
+D_FF = 1024
 NUM_LAYERS = 2
 
 LEARNING_RATE = 3e-4
@@ -97,7 +109,7 @@ model = BinaryToTextTransformer(
     num_layers=NUM_LAYERS,
     max_cipher_length=MAX_CIPHER_LENGTH,
     max_text_length=512,
-)
+).to(device)
 
 
 # =========================================
@@ -130,7 +142,7 @@ def train_epoch():
             break
         cipher = batch["cipher"][
             :, :MAX_CIPHER_LENGTH
-        ]
+        ].to(device)
 
         cipher_padding_mask = (
             batch["cipher_padding_mask"][
@@ -142,23 +154,29 @@ def train_epoch():
             cipher_padding_mask
             .unsqueeze(1)
             .unsqueeze(2)
+            .to(device)
         )
 
         decoder_input = (
             batch["decoder_input"]
+            .to(device)
         )
 
-        target = batch["target"]
+        target = (
+            batch["target"]
+            .to(device)
+        )
 
         decoder_padding_mask = (
             batch["target_padding_mask"]
             .unsqueeze(1)
             .unsqueeze(2)
+            .to(device)
         )
 
         causal_mask = create_causal_mask(
             decoder_input.size(1),
-            decoder_input.device,
+            device,
         )
 
         output = model(
@@ -226,7 +244,7 @@ def validate():
 
         cipher = batch["cipher"][
             :, :MAX_CIPHER_LENGTH
-        ]
+        ].to(device)
 
         cipher_padding_mask = (
             batch["cipher_padding_mask"][
@@ -238,23 +256,29 @@ def validate():
             cipher_padding_mask
             .unsqueeze(1)
             .unsqueeze(2)
+            .to(device)
         )
 
         decoder_input = (
             batch["decoder_input"]
+            .to(device)
         )
 
-        target = batch["target"]
+        target = (
+            batch["target"]
+            .to(device)
+        )
 
         decoder_padding_mask = (
             batch["target_padding_mask"]
             .unsqueeze(1)
             .unsqueeze(2)
+            .to(device)
         )
 
         causal_mask = create_causal_mask(
             decoder_input.size(1),
-            decoder_input.device,
+            device,
         )
 
         output = model(
