@@ -6,6 +6,10 @@ from .models.masks import create_causal_mask
 from .models.transformer import BinaryToTextTransformer
 from .tokenizer import load_tokenizer
 
+device = torch.device(
+    "cuda" if torch.cuda.is_available()
+    else "cpu"
+)
 
 # =========================================
 # Configuration
@@ -69,7 +73,7 @@ model = BinaryToTextTransformer(
     num_layers=NUM_LAYERS,
     max_cipher_length=MAX_CIPHER_LENGTH,
     max_text_length=1024,
-)
+).to(device)
 
 
 # =========================================
