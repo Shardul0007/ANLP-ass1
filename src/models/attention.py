@@ -149,9 +149,10 @@ class ScaledDotProductAttention(nn.Module):
         scores = scores / math.sqrt(head_dim)
 
         if mask is not None:
+            fill_value = -1e4 if scores.dtype == torch.float16 else -1e9
             scores = scores.masked_fill(
                 mask,
-                -1e9,
+                fill_value,
             )
 
         attention_weights = torch.softmax(
