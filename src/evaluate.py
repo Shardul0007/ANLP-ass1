@@ -14,9 +14,9 @@ from .tokenizer import load_tokenizer
 CHECKPOINT = "checkpoints/c1_best.pt"
 
 MAX_CIPHER_LENGTH = 4096
-MAX_GENERATION_LENGTH = 700
+MAX_GENERATION_LENGTH = 300
 
-NUM_EXAMPLES = 20
+MAX_EXAMPLES = 20
 
 VOCAB_SIZE = 8000
 
@@ -85,6 +85,44 @@ _, validation_dataset = random_split(
 
 
 # =========================================
+# Select COMPLETE validation examples
+# =========================================
+
+complete_examples = []
+
+for index in range(
+    len(validation_dataset)
+):
+
+    example = validation_dataset[index]
+
+    cipher_length = (
+        example["cipher"].size(0)
+    )
+
+    if cipher_length <= MAX_CIPHER_LENGTH:
+        complete_examples.append(
+            index
+        )
+
+
+print(
+    "\nComplete validation examples:",
+    len(complete_examples),
+)
+
+print(
+    "Total validation examples:",
+    len(validation_dataset),
+)
+
+print(
+    "Coverage:",
+    f"{100 * len(complete_examples) / len(validation_dataset):.2f}%"
+)
+
+
+# =========================================
 # Model
 # =========================================
 
@@ -132,30 +170,51 @@ print(
 total_correct = 0
 total_tokens = 0
 
+total_exact_matches = 0
+
 total_generated_tokens = 0
 total_target_tokens = 0
 
-total_exact_matches = 0
-total_early_eos = 0
+generation_failures = 0
+
 
 # =========================================
-# Evaluate validation examples
+# Evaluate
 # =========================================
 
 num_examples = min(
-    NUM_EXAMPLES,
-    len(validation_dataset),
+    MAX_EXAMPLES,
+    len(complete_examples),
 )
 
-for index in range(num_examples):
+print(
+    "\nEvaluating",
+    num_examples,
+    "complete examples..."
+)
+
+
+for example_number in range(
+    num_examples
+):
+
+    index = complete_examples[
+        example_number
+    ]
+
+    example = validation_dataset[
+        index
+    ]
 
     print("\n" + "=" * 70)
+
     print(
-        f"EXAMPLE {index + 1}/{num_examples}"
+        f"EXAMPLE {example_number + 1}"
+        f"/{num_examples}"
     )
+
     print("=" * 70)
 
-    example = validation_dataset[index]
 
     # =====================================
     # Cipher
@@ -167,61 +226,22 @@ for index in range(num_examples):
         .to(device)
     )
 
-    original_cipher_length = cipher.size(1)
-
-    cipher = cipher[
-        :, :MAX_CIPHER_LENGTH
-    ]
-
-    print(
-        "\nOriginal cipher length:",
-        original_cipher_length,
-    )
-
-    print(
-        "Cipher length used:",
-        cipher.size(1),
-    )
-
-
-    # =====================================
-    # Target / decoder input
-    # =====================================
-
-    target = (
-        example["target"]
-        .unsqueeze(0)
-        .to(device)
-    )
-
-    decoder_input = (
-        example["decoder_input"]
-        .unsqueeze(0)
-        .to(device)
-    )
-
-    # =====================================
-    # Padding masks
-    # =====================================
-
     cipher_length = cipher.size(1)
 
-    cipher_padding_mask = torch.zeros(
-        (1, 1, 1, cipher_length),
-        dtype=torch.bool,
-        device=device,
+    print(
+        "\nCipher length:",
+        cipher_length,
     )
 
-    decoder_padding_mask = (
-        target == 0
-    ).unsqueeze(1).unsqueeze(2)
 
     # =====================================
-    # Original plaintext
+    # Target
     # =====================================
+
+    target_cpu = example["target"]
 
     target_ids = (
-        example["target"]
+        target_cpu
         .tolist()
     )
 
@@ -232,17 +252,54 @@ for index in range(num_examples):
     ]
 
     if EOS_ID in target_ids:
+
         target_ids = target_ids[
             :target_ids.index(EOS_ID)
         ]
 
-    original_text = tokenizer.decode(
-        target_ids
+
+    # =====================================
+    # Decoder input
+    # =====================================
+
+    decoder_input = (
+        example["decoder_input"]
+        .unsqueeze(0)
+        .to(device)
+    )
+
+    target = (
+        example["target"]
+        .unsqueeze(0)
+        .to(device)
     )
 
 
     # =====================================
-    # 1. Teacher-forced evaluation
+    # Masks
+    # =====================================
+
+    # No cipher padding because this is
+    # a single complete example.
+
+    cipher_padding_mask = torch.zeros(
+        (
+            1,
+            1,
+            1,
+            cipher.size(1),
+        ),
+        dtype=torch.bool,
+        device=device,
+    )
+
+    decoder_padding_mask = (
+        target == 0
+    ).unsqueeze(1).unsqueeze(2)
+
+
+    # =====================================
+    # Teacher-forced evaluation
     # =====================================
 
     with torch.no_grad():
@@ -272,7 +329,11 @@ for index in range(num_examples):
             dim=-1
         )
 
-    # Ignore padding tokens
+
+    # =====================================
+    # Token accuracy
+    # =====================================
+
     valid_positions = (
         target != 0
     )
@@ -292,7 +353,7 @@ for index in range(num_examples):
         .item()
     )
 
-    teacher_forced_accuracy = (
+    accuracy = (
         correct / token_count
         if token_count > 0
         else 0.0
@@ -303,7 +364,7 @@ for index in range(num_examples):
 
 
     # =====================================
-    # 2. Autoregressive generation
+    # Autoregressive generation
     # =====================================
 
     with torch.no_grad():
@@ -316,10 +377,6 @@ for index in range(num_examples):
         )
 
 
-    # =====================================
-    # Decode prediction
-    # =====================================
-
     generated_ids = (
         generated[0]
         .detach()
@@ -327,21 +384,22 @@ for index in range(num_examples):
         .tolist()
     )
 
+
     # Remove BOS
+
     if (
         generated_ids
         and generated_ids[0] == BOS_ID
     ):
+
         generated_ids = (
             generated_ids[1:]
         )
 
-    # Check whether EOS was generated
-    generated_eos = (
-        EOS_ID in generated_ids
-    )
 
-    if generated_eos:
+    # Stop at EOS
+
+    if EOS_ID in generated_ids:
 
         generated_ids = (
             generated_ids[
@@ -351,7 +409,42 @@ for index in range(num_examples):
 
     else:
 
-        total_early_eos += 1
+        generation_failures += 1
+
+
+    # =====================================
+    # Exact match
+    # =====================================
+
+    exact_match = (
+        generated_ids
+        == target_ids
+    )
+
+    if exact_match:
+        total_exact_matches += 1
+
+
+    # =====================================
+    # Length statistics
+    # =====================================
+
+    total_target_tokens += len(
+        target_ids
+    )
+
+    total_generated_tokens += len(
+        generated_ids
+    )
+
+
+    # =====================================
+    # Decode
+    # =====================================
+
+    original_text = tokenizer.decode(
+        target_ids
+    )
 
     generated_text = tokenizer.decode(
         generated_ids
@@ -359,37 +452,12 @@ for index in range(num_examples):
 
 
     # =====================================
-    # Autoregressive statistics
-    # =====================================
-
-    generated_token_count = len(
-        generated_ids
-    )
-
-    target_token_count = len(
-        target_ids
-    )
-
-    total_generated_tokens += (
-        generated_token_count
-    )
-
-    total_target_tokens += (
-        target_token_count
-    )
-
-    # Exact sequence match
-    if generated_ids == target_ids:
-        total_exact_matches += 1
-
-
-    # =====================================
-    # Print example results
+    # Print
     # =====================================
 
     print(
-        "\nTeacher-forced token accuracy:",
-        f"{teacher_forced_accuracy * 100:.2f}%"
+        "\nTeacher-forced accuracy:",
+        f"{accuracy * 100:.2f}%"
     )
 
     print("\nORIGINAL:")
@@ -399,23 +467,23 @@ for index in range(num_examples):
     print(generated_text)
 
     print(
-        "\nOriginal token count:",
-        target_token_count,
+        "\nTarget tokens:",
+        len(target_ids),
     )
 
     print(
-        "Generated token count:",
-        generated_token_count,
+        "Generated tokens:",
+        len(generated_ids),
     )
 
     print(
-        "EOS generated:",
-        generated_eos,
+        "Exact match:",
+        exact_match,
     )
 
 
 # =========================================
-# Final aggregate results
+# Final summary
 # =========================================
 
 overall_accuracy = (
@@ -424,55 +492,73 @@ overall_accuracy = (
     else 0.0
 )
 
-average_generated_length = (
-    total_generated_tokens / num_examples
-)
-
 average_target_length = (
     total_target_tokens / num_examples
+    if num_examples > 0
+    else 0.0
+)
+
+average_generated_length = (
+    total_generated_tokens / num_examples
+    if num_examples > 0
+    else 0.0
 )
 
 exact_match_rate = (
     total_exact_matches / num_examples
+    if num_examples > 0
+    else 0.0
 )
 
+generation_failure_rate = (
+    generation_failures / num_examples
+    if num_examples > 0
+    else 0.0
+)
+
+
 print("\n\n" + "=" * 70)
-print("C1 EVALUATION SUMMARY")
+print("C1 — COMPLETE-INPUT EVALUATION")
 print("=" * 70)
 
 print(
-    f"Examples evaluated: "
-    f"{num_examples}"
+    "Examples evaluated:",
+    num_examples,
 )
 
 print(
-    f"Teacher-forced token accuracy: "
+    "Teacher-forced token accuracy:",
     f"{overall_accuracy * 100:.2f}%"
 )
 
 print(
-    f"Average target length: "
-    f"{average_target_length:.2f} tokens"
+    "Average target length:",
+    f"{average_target_length:.2f}"
 )
 
 print(
-    f"Average generated length: "
-    f"{average_generated_length:.2f} tokens"
+    "Average generated length:",
+    f"{average_generated_length:.2f}"
 )
 
 print(
-    f"Exact sequence matches: "
+    "Exact matches:",
     f"{total_exact_matches}/{num_examples}"
 )
 
 print(
-    f"Exact sequence match rate: "
+    "Exact match rate:",
     f"{exact_match_rate * 100:.2f}%"
 )
 
 print(
-    f"Generation hit max length: "
-    f"{total_early_eos}/{num_examples}"
+    "Generation hit max length:",
+    f"{generation_failures}/{num_examples}"
+)
+
+print(
+    "Generation failure rate:",
+    f"{generation_failure_rate * 100:.2f}%"
 )
 
 print("=" * 70)
