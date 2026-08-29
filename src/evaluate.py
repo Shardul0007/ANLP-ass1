@@ -204,21 +204,17 @@ for index in range(num_examples):
     # Padding masks
     # =====================================
 
-    cipher_padding_mask = (
-        example["cipher_padding_mask"]
-        .unsqueeze(0)
-        .unsqueeze(1)
-        .unsqueeze(2)
-        .to(device)
+    cipher_length = cipher.size(1)
+
+    cipher_padding_mask = torch.zeros(
+        (1, 1, 1, cipher_length),
+        dtype=torch.bool,
+        device=device,
     )
 
     decoder_padding_mask = (
-        example["target_padding_mask"]
-        .unsqueeze(0)
-        .unsqueeze(1)
-        .unsqueeze(2)
-        .to(device)
-    )
+        target == 0
+    ).unsqueeze(1).unsqueeze(2)
 
     # =====================================
     # Original plaintext
