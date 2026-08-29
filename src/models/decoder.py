@@ -1,8 +1,8 @@
 import torch.nn as nn
 
-from .attention import MultiHeadAttention
+from .attention import GroupedQueryAttention, MultiHeadAttention
 from .ffn import FeedForwardNetwork
-from .norm import LayerNorm
+from .norm import LayerNorm, RMSNorm
 
 
 class DecoderLayer(nn.Module):
@@ -12,24 +12,50 @@ class DecoderLayer(nn.Module):
         num_heads,
         d_ff,
         dropout=0.1,
+        use_rope=False,
+        norm_type="layernorm",
+        attention_type="mha",
+        num_kv_heads=None,
+        max_len=8192,
     ):
         super().__init__()
 
-        self.norm1 = LayerNorm(d_model)
-        self.norm2 = LayerNorm(d_model)
-        self.norm3 = LayerNorm(d_model)
+        norm_cls = RMSNorm if norm_type.lower() == "rmsnorm" else LayerNorm
+        self.norm1 = norm_cls(d_model)
+        self.norm2 = norm_cls(d_model)
+        self.norm3 = norm_cls(d_model)
 
-        self.self_attention = MultiHeadAttention(
-            d_model=d_model,
-            num_heads=num_heads,
-            dropout=dropout,
-        )
-
-        self.cross_attention = MultiHeadAttention(
-            d_model=d_model,
-            num_heads=num_heads,
-            dropout=dropout,
-        )
+        if attention_type.lower() == "gqa":
+            kv_heads = (
+                num_kv_heads if num_kv_heads is not None else max(1, num_heads // 2)
+            )
+            self.self_attention = GroupedQueryAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                num_kv_heads=kv_heads,
+                dropout=dropout,
+            )
+            self.cross_attention = GroupedQueryAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                num_kv_heads=kv_heads,
+                dropout=dropout,
+            )
+        else:
+            self.self_attention = MultiHeadAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                dropout=dropout,
+                use_rope=use_rope,
+                max_len=max_len,
+            )
+            self.cross_attention = MultiHeadAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                dropout=dropout,
+                use_rope=use_rope,
+                max_len=max_len,
+            )
 
         self.ffn = FeedForwardNetwork(
             d_model=d_model,

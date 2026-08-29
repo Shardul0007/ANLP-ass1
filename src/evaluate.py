@@ -18,16 +18,22 @@ from .dataset import BinaryToTextDataset
 from .models.transformer import BinaryToTextTransformer
 from .tokenizer import load_tokenizer
 from .training import split_dataset
-from .utils import compute_all_metrics
+from .utils import compute_all_metrics, compute_levenshtein_distance
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate C1 Transformer")
+    parser = argparse.ArgumentParser(description="Evaluate Transformer (C1-C5)")
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/c1_best.pt",
+        default="checkpoints/c2_best.pt",
         help="Path to checkpoint file",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Model config (auto-detected if None)",
     )
     parser.add_argument(
         "--num_examples",
@@ -48,6 +54,18 @@ def parse_args():
         help="Maximum generation length in tokens",
     )
     parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=1.0,
+        help="Repetition penalty for greedy decoding (1.0 = standard greedy)",
+    )
+    parser.add_argument(
+        "--no_repeat_ngram_size",
+        type=int,
+        default=0,
+        help="Block repeating n-grams of this size (0 = off, 3 = recommended)",
+    )
+    parser.add_argument(
         "--d_model", type=int, default=256, help="Model hidden dimension"
     )
     parser.add_argument(
@@ -62,7 +80,7 @@ def parse_args():
     parser.add_argument(
         "--output_file",
         type=str,
-        default="outputs/c1_eval_results.txt",
+        default=None,
         help="Path to save evaluation summary",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -96,6 +114,19 @@ def detect_dims_from_checkpoint(checkpoint):
             "decoder_position.positional_encoding"
         ].shape[1]
 
+    # Detect ablation settings
+    has_sinusoidal = "encoder_position.positional_encoding" in state_dict
+    pos_encoding = "sinusoidal" if has_sinusoidal else "rope"
+
+    is_rmsnorm = "encoder_norm.gamma" in state_dict and "encoder_norm.beta" not in state_dict
+    norm_type = "rmsnorm" if is_rmsnorm else "layernorm"
+
+    is_gqa = any(
+        "k_projection.weight" in k and state_dict[k].shape[0] != d_model
+        for k in state_dict
+    )
+    attention_type = "gqa" if is_gqa else "mha"
+
     return (
         d_model,
         vocab_size,
@@ -103,6 +134,9 @@ def detect_dims_from_checkpoint(checkpoint):
         d_ff,
         max_cipher_len,
         max_text_len,
+        pos_encoding,
+        attention_type,
+        norm_type,
     )
 
 
@@ -131,7 +165,7 @@ def main():
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    # Detect dimensions if possible
+    # Detect dimensions and ablation architecture if possible
     try:
         (
             d_model,
@@ -140,10 +174,14 @@ def main():
             d_ff,
             max_cipher_len,
             max_text_len,
+            pos_encoding,
+            attention_type,
+            norm_type,
         ) = detect_dims_from_checkpoint(checkpoint)
         print(
             f"Detected from checkpoint: d_model={d_model}, d_ff={d_ff}, "
             f"vocab={vocab_size}, layers={num_layers}, "
+            f"pos_encoding={pos_encoding}, attention={attention_type}, norm={norm_type}, "
             f"max_cipher_len={max_cipher_len}, max_text_len={max_text_len}"
         )
     except Exception:
@@ -153,6 +191,25 @@ def main():
         num_layers = args.num_layers
         max_cipher_len = args.max_cipher_len
         max_text_len = args.max_text_len
+        pos_encoding = "rope" if (args.config and args.config.lower() == "c2") else "sinusoidal"
+        attention_type = "gqa" if (args.config and args.config.lower() == "c3") else "mha"
+        norm_type = "rmsnorm" if (args.config and args.config.lower() == "c4") else "layernorm"
+
+    # Determine config tag for reporting
+    if pos_encoding == "rope":
+        tag = "C2: RoPE"
+        cfg_name = "c2"
+    elif attention_type == "gqa":
+        tag = "C3: GQA"
+        cfg_name = "c3"
+    elif norm_type == "rmsnorm":
+        tag = "C4: RMSNorm"
+        cfg_name = "c4"
+    else:
+        tag = "C1: Baseline"
+        cfg_name = "c1"
+
+    output_file = args.output_file or f"outputs/{cfg_name}_eval_results.txt"
 
     # Load validation dataset
     dataset = BinaryToTextDataset(
@@ -176,6 +233,9 @@ def main():
         num_layers=num_layers,
         max_cipher_length=max_cipher_len,
         max_text_length=max_text_len,
+        pos_encoding=pos_encoding,
+        attention_type=attention_type,
+        norm_type=norm_type,
     ).to(device)
 
     # Load weights with shape-safe filtering
@@ -199,7 +259,7 @@ def main():
 
     epoch = checkpoint.get("epoch", "N/A")
     val_loss = checkpoint.get("validation_loss", "N/A")
-    print(f"Model loaded (Trained Epoch: {epoch}, Val Loss: {val_loss})")
+    print(f"Model loaded (Configuration: {tag}, Trained Epoch: {epoch}, Val Loss: {val_loss})")
 
     targets = []
     predictions = []
@@ -221,6 +281,8 @@ def main():
             bos_token_id=bos_id,
             eos_token_id=eos_id,
             max_length=args.max_gen_len,
+            repetition_penalty=args.repetition_penalty,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
         )
 
         gen_ids = gen_tokens[0].detach().cpu().tolist()
@@ -245,7 +307,7 @@ def main():
     header = "=" * 70
     output_lines = [
         header,
-        "CONFIGURATION C1: BASELINE EVALUATION REPORT",
+        f"CONFIGURATION {tag.upper()} EVALUATION REPORT",
         header,
         f"Checkpoint:            {checkpoint_path}",
         f"Evaluated Examples:    {eval_count}",
@@ -267,7 +329,7 @@ def main():
                 f"\n[Sample {idx + 1}]",
                 f"TARGET:     {targets[idx]}",
                 f"PREDICTION: {predictions[idx]}",
-                f"Levenshtein Dist: {levenshtein_distance(targets[idx], predictions[idx])}",
+                f"Levenshtein Dist: {compute_levenshtein_distance(targets[idx], predictions[idx])}",
             ]
         )
 
@@ -276,11 +338,11 @@ def main():
     print("\n" + summary_text)
 
     # Save to outputs
-    os.makedirs(Path(args.output_file).parent, exist_ok=True)
-    with open(args.output_file, "w", encoding="utf-8") as f:
+    os.makedirs(Path(output_file).parent, exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
         f.write(summary_text)
 
-    print(f"\nResults saved to: {args.output_file}")
+    print(f"\nResults saved to: {output_file}")
 
 
 if __name__ == "__main__":

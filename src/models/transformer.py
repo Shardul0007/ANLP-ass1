@@ -7,7 +7,8 @@ from .decoder import DecoderLayer
 from .encoder import EncoderLayer
 from .positional import SinusoidalPositionalEncoding
 from .masks import create_causal_mask
-from .norm import LayerNorm
+from .norm import LayerNorm, RMSNorm
+
 
 class Encoder(nn.Module):
     def __init__(
@@ -17,6 +18,11 @@ class Encoder(nn.Module):
         num_heads,
         d_ff,
         dropout=0.1,
+        use_rope=False,
+        norm_type="layernorm",
+        attention_type="mha",
+        num_kv_heads=None,
+        max_len=8192,
     ):
         super().__init__()
 
@@ -27,6 +33,11 @@ class Encoder(nn.Module):
                     num_heads=num_heads,
                     d_ff=d_ff,
                     dropout=dropout,
+                    use_rope=use_rope,
+                    norm_type=norm_type,
+                    attention_type=attention_type,
+                    num_kv_heads=num_kv_heads,
+                    max_len=max_len,
                 )
                 for _ in range(num_layers)
             ]
@@ -58,6 +69,11 @@ class Decoder(nn.Module):
         num_heads,
         d_ff,
         dropout=0.1,
+        use_rope=False,
+        norm_type="layernorm",
+        attention_type="mha",
+        num_kv_heads=None,
+        max_len=8192,
     ):
         super().__init__()
 
@@ -68,6 +84,11 @@ class Decoder(nn.Module):
                     num_heads=num_heads,
                     d_ff=d_ff,
                     dropout=dropout,
+                    use_rope=use_rope,
+                    norm_type=norm_type,
+                    attention_type=attention_type,
+                    num_kv_heads=num_kv_heads,
+                    max_len=max_len,
                 )
                 for _ in range(num_layers)
             ]
@@ -118,13 +139,21 @@ class BinaryToTextTransformer(nn.Module):
         num_heads=8,
         d_ff=1024,
         num_layers=2,
-        max_cipher_length=12000,
+        max_cipher_length=8192,
         max_text_length=1024,
         dropout=0.1,
+        pos_encoding="sinusoidal",
+        attention_type="mha",
+        norm_type="layernorm",
+        num_kv_heads=None,
     ):
         super().__init__()
 
         self.d_model = d_model
+        self.pos_encoding = pos_encoding.lower()
+        self.use_rope = (self.pos_encoding == "rope")
+        self.attention_type = attention_type.lower()
+        self.norm_type = norm_type.lower()
 
         # =========================================
         # Embeddings
@@ -147,19 +176,18 @@ class BinaryToTextTransformer(nn.Module):
         # Positional encodings
         # =========================================
 
-        self.encoder_position = (
-            SinusoidalPositionalEncoding(
+        if self.use_rope:
+            self.encoder_position = nn.Identity()
+            self.decoder_position = nn.Identity()
+        else:
+            self.encoder_position = SinusoidalPositionalEncoding(
                 d_model=d_model,
                 max_sequence_length=max_cipher_length,
             )
-        )
-
-        self.decoder_position = (
-            SinusoidalPositionalEncoding(
+            self.decoder_position = SinusoidalPositionalEncoding(
                 d_model=d_model,
                 max_sequence_length=max_text_length,
             )
-        )
 
         # =========================================
         # Encoder
@@ -171,8 +199,15 @@ class BinaryToTextTransformer(nn.Module):
             num_heads=num_heads,
             d_ff=d_ff,
             dropout=dropout,
+            use_rope=self.use_rope,
+            norm_type=self.norm_type,
+            attention_type=self.attention_type,
+            num_kv_heads=num_kv_heads,
+            max_len=max_cipher_length,
         )
-        self.encoder_norm = LayerNorm(d_model)
+
+        norm_cls = RMSNorm if self.norm_type == "rmsnorm" else LayerNorm
+        self.encoder_norm = norm_cls(d_model)
 
         # =========================================
         # Decoder
@@ -184,8 +219,13 @@ class BinaryToTextTransformer(nn.Module):
             num_heads=num_heads,
             d_ff=d_ff,
             dropout=dropout,
+            use_rope=self.use_rope,
+            norm_type=self.norm_type,
+            attention_type=self.attention_type,
+            num_kv_heads=num_kv_heads,
+            max_len=max_text_length,
         )
-        self.decoder_norm = LayerNorm(d_model)
+        self.decoder_norm = norm_cls(d_model)
 
         # =========================================
         # Vocabulary projection
@@ -304,6 +344,8 @@ class BinaryToTextTransformer(nn.Module):
         eos_token_id,
         max_length=128,
         cipher_padding_mask=None,
+        repetition_penalty=1.0,
+        no_repeat_ngram_size=0,
     ):
         """
         Autoregressively generate plaintext token IDs using greedy decoding.
@@ -400,6 +442,28 @@ class BinaryToTextTransformer(nn.Module):
             logits = self.output_projection(
                 last_hidden
             )
+
+            # Apply repetition penalty if requested
+            if repetition_penalty > 1.0:
+                for b in range(generated.size(0)):
+                    for prev_token in set(generated[b].tolist()):
+                        if logits[b, prev_token] < 0:
+                            logits[b, prev_token] = logits[b, prev_token] * repetition_penalty
+                        else:
+                            logits[b, prev_token] = logits[b, prev_token] / repetition_penalty
+
+            # Block repeating n-grams if requested
+            if no_repeat_ngram_size > 0 and generated.size(1) >= no_repeat_ngram_size:
+                for b in range(generated.size(0)):
+                    tokens = generated[b].tolist()
+                    cur_prefix = tuple(tokens[-(no_repeat_ngram_size - 1) :])
+                    banned = set()
+                    for i in range(len(tokens) - no_repeat_ngram_size + 1):
+                        ngram = tuple(tokens[i : i + no_repeat_ngram_size])
+                        if ngram[:-1] == cur_prefix:
+                            banned.add(ngram[-1])
+                    for banned_id in banned:
+                        logits[b, banned_id] = -float("inf")
 
             next_token = logits.argmax(
                 dim=-1

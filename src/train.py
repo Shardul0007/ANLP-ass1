@@ -58,8 +58,15 @@ def get_cosine_schedule_with_warmup(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train C1 Base Transformer")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs")
+    parser = argparse.ArgumentParser(description="Train Transformer (C1-C5 Ablations)")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="c2",
+        choices=["c1", "c2", "c3", "c4", "c5"],
+        help="Ablation configuration: c1=base, c2=RoPE, c3=GQA, c4=RMSNorm, c5=BLT",
+    )
+    parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=2, help="Base batch size")
     parser.add_argument(
         "--accum_steps",
@@ -87,12 +94,30 @@ def parse_args():
         "--num_heads", type=int, default=8, help="Number of attention heads"
     )
     parser.add_argument(
+        "--num_kv_heads",
+        type=int,
+        default=4,
+        help="Number of key/value heads for GQA (C3)",
+    )
+    parser.add_argument(
         "--d_ff", type=int, default=1024, help="Feed-forward network hidden dimension"
     )
     parser.add_argument(
         "--num_layers", type=int, default=2, help="Number of encoder/decoder layers"
     )
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
+    parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=1.0,
+        help="Repetition penalty for greedy generation (1.0 = none)",
+    )
+    parser.add_argument(
+        "--no_repeat_ngram_size",
+        type=int,
+        default=0,
+        help="Block repeating n-grams of this size (0 = off, 3 = recommended)",
+    )
     parser.add_argument(
         "--use_bucketing",
         action="store_true",
@@ -124,7 +149,13 @@ def parse_args():
         help="WandB project name",
     )
     parser.add_argument(
-        "--run_name", type=str, default="C1-Baseline", help="Run name for WandB"
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="WandB entity (username or team name)",
+    )
+    parser.add_argument(
+        "--run_name", type=str, default=None, help="Run name for WandB"
     )
     parser.add_argument(
         "--checkpoint_dir",
@@ -307,6 +338,8 @@ def evaluate_generation_metrics(
     num_examples=30,
     max_gen_len=300,
     use_amp=False,
+    repetition_penalty=1.0,
+    no_repeat_ngram_size=0,
 ):
     """Runs greedy decoding and computes assignment metrics on validation examples."""
     model.eval()
@@ -336,6 +369,8 @@ def evaluate_generation_metrics(
                 bos_token_id=bos_id,
                 eos_token_id=eos_id,
                 max_length=max_gen_len,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
             )
 
         gen_ids = gen_tokens[0].detach().cpu().tolist()
@@ -367,6 +402,42 @@ def main():
     if use_amp:
         print("Automatic Mixed Precision (AMP FP16) enabled.")
 
+    # Map configuration ablation settings (Table 1)
+    cfg = args.config.lower()
+    if cfg == "c1":
+        pos_encoding = "sinusoidal"
+        attention_type = "mha"
+        norm_type = "layernorm"
+        default_name = "C1-Baseline"
+    elif cfg == "c2":
+        pos_encoding = "rope"
+        attention_type = "mha"
+        norm_type = "layernorm"
+        default_name = "C2-RoPE"
+    elif cfg == "c3":
+        pos_encoding = "sinusoidal"
+        attention_type = "gqa"
+        norm_type = "layernorm"
+        default_name = "C3-GQA"
+    elif cfg == "c4":
+        pos_encoding = "sinusoidal"
+        attention_type = "mha"
+        norm_type = "rmsnorm"
+        default_name = "C4-RMSNorm"
+    else:
+        pos_encoding = "sinusoidal"
+        attention_type = "mha"
+        norm_type = "layernorm"
+        default_name = f"Config-{args.config.upper()}"
+
+    run_name = args.run_name if args.run_name is not None else default_name
+    print(
+        f"\n=== Configuration: {cfg.upper()} ({default_name}) ==="
+        f"\nPositional Encoding: {pos_encoding}"
+        f"\nAttention Type:      {attention_type}"
+        f"\nNorm Type:            {norm_type}"
+    )
+
     # Initialize WandB if requested
     wandb_run = None
     if args.wandb:
@@ -375,7 +446,8 @@ def main():
 
             wandb_run = wandb.init(
                 project=args.wandb_project,
-                name=args.run_name,
+                entity=args.wandb_entity,
+                name=run_name,
                 config=vars(args),
             )
             print("WandB initialized successfully.")
@@ -440,6 +512,10 @@ def main():
         max_cipher_length=args.max_cipher_len,
         max_text_length=args.max_text_len,
         dropout=args.dropout,
+        pos_encoding=pos_encoding,
+        attention_type=attention_type,
+        norm_type=norm_type,
+        num_kv_heads=args.num_kv_heads,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -523,6 +599,8 @@ def main():
             device=device,
             num_examples=args.eval_samples,
             use_amp=use_amp,
+            repetition_penalty=args.repetition_penalty,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
         )
 
         if torch.cuda.is_available():
@@ -570,7 +648,7 @@ def main():
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
-            best_path = os.path.join(args.checkpoint_dir, "c1_best.pt")
+            best_path = os.path.join(args.checkpoint_dir, f"{cfg}_best.pt")
             save_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -580,7 +658,7 @@ def main():
             )
             print(f"[*] New best model saved to {best_path}")
 
-        epoch_path = os.path.join(args.checkpoint_dir, f"c1_epoch_{epoch}.pt")
+        epoch_path = os.path.join(args.checkpoint_dir, f"{cfg}_epoch_{epoch}.pt")
         save_checkpoint(
             model=model,
             optimizer=optimizer,
@@ -594,8 +672,8 @@ def main():
         train_losses=train_losses,
         val_losses=val_losses,
         metric_history=metric_history,
-        output_path="outputs/c1_training_curves.png",
-        title="Training Progression - Configuration 1 (Base)",
+        output_path=f"outputs/{cfg}_training_curves.png",
+        title=f"Training Progression - {default_name}",
     )
 
     if wandb_run is not None:

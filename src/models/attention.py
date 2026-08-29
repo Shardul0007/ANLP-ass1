@@ -3,8 +3,15 @@ import math
 import torch
 import torch.nn as nn
 
+from .positional import (
+    RotaryPositionEmbedding,
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_single,
+)
+
+
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, num_heads, dropout=0.0):
+    def __init__(self, d_model, num_heads, dropout=0.0, use_rope=False, max_len=8192):
         super().__init__()
 
         if d_model % num_heads != 0:
@@ -15,6 +22,10 @@ class MultiHeadAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.use_rope = use_rope
+
+        if use_rope:
+            self.rope = RotaryPositionEmbedding(dim=self.head_dim, max_len=max_len)
 
         # Learned projections for Q, K and V.
         self.q_projection = nn.Linear(
@@ -111,6 +122,17 @@ class MultiHeadAttention(nn.Module):
         q = self.split_heads(q)
         k = self.split_heads(k)
         v = self.split_heads(v)
+
+        # 2b. Apply Rotary Position Embedding (RoPE) if enabled
+        if self.use_rope:
+            if q.size(-2) == k.size(-2):
+                cos, sin = self.rope(q)
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            else:
+                cos_q, sin_q = self.rope(q)
+                cos_k, sin_k = self.rope(k)
+                q = apply_rotary_pos_emb_single(q, cos_q, sin_q)
+                k = apply_rotary_pos_emb_single(k, cos_k, sin_k)
 
         # 3. Perform scaled dot-product attention.
         attention_output, attention_weights = self.attention(
