@@ -36,7 +36,7 @@ from .training import (
 
 BATCH_SIZE = 1
 
-EPOCHS = 1
+EPOCHS = 5
 
 MAX_CIPHER_LENGTH = 4096
 
@@ -50,8 +50,8 @@ NUM_LAYERS = 2
 LEARNING_RATE = 3e-4
 
 CHECKPOINT_DIR = "checkpoints"
-MAX_TRAIN_BATCHES = 100
-MAX_VALIDATION_BATCHES = 20
+MAX_TRAIN_BATCHES = None
+MAX_VALIDATION_BATCHES = None
 
 
 # =========================================
@@ -138,7 +138,10 @@ def train_epoch():
     for batch_index, batch in enumerate(
         train_loader
     ):
-        if batch_index >= MAX_TRAIN_BATCHES:
+        if (
+            MAX_TRAIN_BATCHES is not None
+            and batch_index >= MAX_TRAIN_BATCHES
+        ):
             break
         cipher = batch["cipher"][
             :, :MAX_CIPHER_LENGTH
@@ -239,9 +242,11 @@ def validate():
     total_loss = 0.0
 
     for batch_index, batch in enumerate(validation_loader):
-        if batch_index >= MAX_VALIDATION_BATCHES:
+        if (
+            MAX_VALIDATION_BATCHES is not None
+            and batch_index >= MAX_VALIDATION_BATCHES
+        ):
             break
-
         cipher = batch["cipher"][
             :, :MAX_CIPHER_LENGTH
         ].to(device)
@@ -319,6 +324,7 @@ os.makedirs(
     CHECKPOINT_DIR,
     exist_ok=True,
 )
+best_validation_loss = float("inf")
 
 for epoch in range(
     1,
@@ -345,6 +351,27 @@ for epoch in range(
         f"Validation loss: "
         f"{validation_loss:.4f}"
     )
+
+    if validation_loss < best_validation_loss:
+        best_validation_loss = validation_loss
+
+        best_checkpoint_path = os.path.join(
+            CHECKPOINT_DIR,
+            "c1_best.pt",
+        )
+
+        save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch,
+            validation_loss=validation_loss,
+            path=best_checkpoint_path,
+        )
+
+        print(
+            f"Best checkpoint saved: "
+            f"{best_checkpoint_path}"
+        )
 
     checkpoint_path = os.path.join(
         CHECKPOINT_DIR,
