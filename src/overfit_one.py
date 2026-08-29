@@ -41,16 +41,18 @@ dataset = BinaryToTextDataset(
 # Pick ONE example.
 example = dataset[0]
 
-cipher = example["cipher"].unsqueeze(0)
+cipher = example["cipher"].unsqueeze(0).to(device)
 
 decoder_input = (
     example["decoder_input"]
     .unsqueeze(0)
+    .to(device)
 )
 
 target = (
     example["target"]
     .unsqueeze(0)
+    .to(device)
 )
 
 
@@ -58,7 +60,7 @@ target = (
 # Truncate cipher if necessary
 # =========================================
 
-cipher = cipher[:, :MAX_CIPHER_LENGTH]
+cipher = cipher[:, :MAX_CIPHER_LENGTH].to(device)
 
 
 # =========================================
@@ -100,7 +102,7 @@ for step in range(1, STEPS + 1):
 
     causal_mask = create_causal_mask(
         decoder_input.size(1),
-        decoder_input.device,
+        device,
     )
 
     output = model(
