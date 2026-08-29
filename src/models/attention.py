@@ -89,6 +89,7 @@ class MultiHeadAttention(nn.Module):
         key,
         value,
         mask=None,
+        need_weights=False,
     ):
         """
         query:
@@ -117,6 +118,7 @@ class MultiHeadAttention(nn.Module):
             k,
             v,
             mask,
+            need_weights=need_weights,
         )
 
         # 4. Combine heads.
@@ -132,9 +134,42 @@ class MultiHeadAttention(nn.Module):
         return output, attention_weights
 
 class ScaledDotProductAttention(nn.Module):
-    def __init__(self, dropout=0.0):
+    def __init__(self, dropout=0.0, chunk_size=1024):
         super().__init__()
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+        self.chunk_size = chunk_size
+
+    def _compute_chunk(self, query, key, value, mask=None, need_weights=False):
+        head_dim = query.size(-1)
+
+        scores = torch.matmul(
+            query,
+            key.transpose(-2, -1),
+        )
+        scores = scores / math.sqrt(head_dim)
+
+        if mask is not None:
+            scores = scores.masked_fill(
+                mask,
+                -1e9,
+            )
+
+        attention_weights = torch.softmax(
+            scores,
+            dim=-1,
+        )
+        del scores
+
+        attention_weights_dropped = self.dropout(attention_weights)
+
+        output = torch.matmul(
+            attention_weights_dropped,
+            value,
+        )
+
+        if need_weights:
+            return output, attention_weights
+        return output, None
 
     def forward(
         self,
@@ -142,57 +177,46 @@ class ScaledDotProductAttention(nn.Module):
         key,
         value,
         mask=None,
+        need_weights=False,
     ):
         """
         query: [batch, heads, query_length, head_dim]
         key:   [batch, heads, key_length, head_dim]
         value: [batch, heads, key_length, head_dim]
-
-        Returns:
-            output:
-                [batch, heads, query_length, head_dim]
-
-            attention_weights:
-                [batch, heads, query_length, key_length]
         """
+        q_len = query.size(-2)
 
-        head_dim = query.size(-1)
+        # Fast path for standard length or when chunking is not beneficial
+        if q_len <= self.chunk_size:
+            return self._compute_chunk(query, key, value, mask, need_weights=need_weights)
 
-        # 1. Compute QK^T
-        scores = torch.matmul(
-            query,
-            key.transpose(-2, -1),
-        )
+        # Memory-efficient chunked computation across query dimension:
+        # Splits query into blocks of chunk_size to keep peak attention memory small
+        outputs = []
+        weights = [] if need_weights else None
 
-        # 2. Scale by sqrt(d_k)
-        scores = scores / math.sqrt(head_dim)
-
-        # 3. Apply mask if provided (safe masked_fill)
-        if mask is not None:
-            scores = scores.masked_fill(
-                mask,
-                -1e9,
+        for i in range(0, q_len, self.chunk_size):
+            q_chunk = query[:, :, i : i + self.chunk_size, :]
+            m_chunk = (
+                mask[:, :, i : i + self.chunk_size, :]
+                if mask is not None and mask.size(-2) > 1
+                else mask
             )
+            out_c, w_c = self._compute_chunk(
+                q_chunk, key, value, m_chunk, need_weights=need_weights
+            )
+            outputs.append(out_c)
+            if need_weights and w_c is not None:
+                weights.append(w_c)
 
-        # 4. Convert scores to probabilities
-        attention_weights = torch.softmax(
-            scores,
-            dim=-1,
-        )
+        output = torch.cat(outputs, dim=-2)
+        total_weights = torch.cat(weights, dim=-2) if need_weights else None
 
-        attention_weights_dropped = self.dropout(attention_weights)
-
-        # 5. Weighted sum of values
-        output = torch.matmul(
-            attention_weights_dropped,
-            value,
-        )
-
-        return output, attention_weights
+        return output, total_weights
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model, num_heads, num_kv_heads, dropout=0.0):
+    def __init__(self, d_model, num_heads, num_kv_heads, dropout=0.0, chunk_size=1024):
         super().__init__()
 
         if d_model % num_heads != 0:
@@ -211,14 +235,14 @@ class GroupedQueryAttention(nn.Module):
         self.v_projection = nn.Linear(d_model, self.num_kv_heads * self.head_dim)
         self.output_projection = nn.Linear(d_model, d_model)
 
-        self.attention = ScaledDotProductAttention(dropout=dropout)
+        self.attention = ScaledDotProductAttention(dropout=dropout, chunk_size=chunk_size)
 
     def split_heads(self, x, num_heads):
         batch_size, sequence_length, _ = x.shape
         x = x.view(batch_size, sequence_length, num_heads, self.head_dim)
         return x.transpose(1, 2)
 
-    def forward(self, query, key, value, mask=None):
+    def forward(self, query, key, value, mask=None, need_weights=False):
         q = self.q_projection(query)
         k = self.k_projection(key)
         v = self.v_projection(value)
@@ -232,7 +256,9 @@ class GroupedQueryAttention(nn.Module):
             k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
             v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
 
-        attention_output, attention_weights = self.attention(q, k, v, mask=mask)
+        attention_output, attention_weights = self.attention(
+            q, k, v, mask=mask, need_weights=need_weights
+        )
 
         # Combine heads
         batch_size, _, sequence_length, _ = attention_output.shape

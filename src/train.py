@@ -9,6 +9,9 @@ import random
 import time
 from pathlib import Path
 
+# Enable memory fragmentation mitigation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -19,6 +22,18 @@ from .models.masks import create_causal_mask
 from .models.transformer import BinaryToTextTransformer
 from .training import save_checkpoint, split_dataset
 from .utils import compute_all_metrics, plot_training_curves
+
+
+def get_autocast(device_type, enabled):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type=device_type, enabled=enabled)
+    return torch.cuda.amp.autocast(enabled=enabled)
+
+
+def get_grad_scaler(device_type, enabled):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler(device_type, enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
 def set_seed(seed=42):
@@ -119,6 +134,12 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
+        "--no_amp",
+        action="store_true",
+        default=False,
+        help="Disable automatic mixed precision (AMP FP16)",
+    )
+    parser.add_argument(
         "--max_train_batches",
         type=int,
         default=None,
@@ -141,6 +162,8 @@ def train_one_epoch(
     scheduler,
     criterion,
     device,
+    scaler=None,
+    use_amp=False,
     accum_steps=1,
     max_batches=None,
     vocab_size=8000,
@@ -169,29 +192,38 @@ def train_one_epoch(
         )
         causal_mask = create_causal_mask(decoder_input.size(1), device)
 
-        output = model(
-            cipher,
-            decoder_input,
-            cipher_padding_mask=cipher_padding_mask,
-            decoder_self_attention_mask=causal_mask,
-            decoder_padding_mask=decoder_padding_mask,
-        )
+        with get_autocast(device.type, use_amp):
+            output = model(
+                cipher,
+                decoder_input,
+                cipher_padding_mask=cipher_padding_mask,
+                decoder_self_attention_mask=causal_mask,
+                decoder_padding_mask=decoder_padding_mask,
+            )
 
-        logits = output["logits"]
-        loss = criterion(
-            logits.reshape(-1, vocab_size),
-            target.reshape(-1),
-        )
+            logits = output["logits"]
+            loss = criterion(
+                logits.reshape(-1, vocab_size),
+                target.reshape(-1),
+            )
+            scaled_loss = loss / accum_steps
 
-        # Scale loss for gradient accumulation
-        scaled_loss = loss / accum_steps
-        scaled_loss.backward()
-
-        if (batch_index + 1) % accum_steps == 0 or (batch_index + 1) == num_batches:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+        if use_amp and scaler is not None:
+            scaler.scale(scaled_loss).backward()
+            if (batch_index + 1) % accum_steps == 0 or (batch_index + 1) == num_batches:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+        else:
+            scaled_loss.backward()
+            if (batch_index + 1) % accum_steps == 0 or (batch_index + 1) == num_batches:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
 
         total_loss += loss.item()
 
@@ -220,7 +252,15 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate_loss(model, loader, criterion, device, vocab_size=8000, max_batches=None):
+def evaluate_loss(
+    model,
+    loader,
+    criterion,
+    device,
+    vocab_size=8000,
+    max_batches=None,
+    use_amp=False,
+):
     model.eval()
     total_loss = 0.0
     num_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
@@ -240,18 +280,19 @@ def evaluate_loss(model, loader, criterion, device, vocab_size=8000, max_batches
         )
         causal_mask = create_causal_mask(decoder_input.size(1), device)
 
-        output = model(
-            cipher,
-            decoder_input,
-            cipher_padding_mask=cipher_padding_mask,
-            decoder_self_attention_mask=causal_mask,
-            decoder_padding_mask=decoder_padding_mask,
-        )
+        with get_autocast(device.type, use_amp):
+            output = model(
+                cipher,
+                decoder_input,
+                cipher_padding_mask=cipher_padding_mask,
+                decoder_self_attention_mask=causal_mask,
+                decoder_padding_mask=decoder_padding_mask,
+            )
 
-        loss = criterion(
-            output["logits"].reshape(-1, vocab_size),
-            target.reshape(-1),
-        )
+            loss = criterion(
+                output["logits"].reshape(-1, vocab_size),
+                target.reshape(-1),
+            )
         total_loss += loss.item()
 
     return total_loss / max(1, num_batches)
@@ -259,7 +300,13 @@ def evaluate_loss(model, loader, criterion, device, vocab_size=8000, max_batches
 
 @torch.no_grad()
 def evaluate_generation_metrics(
-    model, validation_dataset, tokenizer, device, num_examples=30, max_gen_len=300
+    model,
+    validation_dataset,
+    tokenizer,
+    device,
+    num_examples=30,
+    max_gen_len=300,
+    use_amp=False,
 ):
     """Runs greedy decoding and computes assignment metrics on validation examples."""
     model.eval()
@@ -283,12 +330,13 @@ def evaluate_generation_metrics(
             ref_text = tokenizer.decode(tgt_ids)
 
         # Greedy decoding
-        gen_tokens = model.generate(
-            cipher=cipher,
-            bos_token_id=bos_id,
-            eos_token_id=eos_id,
-            max_length=max_gen_len,
-        )
+        with get_autocast(device.type, use_amp):
+            gen_tokens = model.generate(
+                cipher=cipher,
+                bos_token_id=bos_id,
+                eos_token_id=eos_id,
+                max_length=max_gen_len,
+            )
 
         gen_ids = gen_tokens[0].detach().cpu().tolist()
         if gen_ids and gen_ids[0] == bos_id:
@@ -313,6 +361,11 @@ def main():
     print(f"Using device: {device}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    use_amp = (not args.no_amp) and torch.cuda.is_available()
+    scaler = get_grad_scaler(device.type, use_amp)
+    if use_amp:
+        print("Automatic Mixed Precision (AMP FP16) enabled.")
 
     # Initialize WandB if requested
     wandb_run = None
@@ -352,7 +405,7 @@ def main():
         print("Using LengthBucketBatchSampler for training...")
         train_sampler = LengthBucketBatchSampler(
             dataset=train_dataset,
-            batch_sizes=[args.batch_size * 2, args.batch_size, 1, 1],
+            batch_sizes=[max(1, args.batch_size), 1, 1, 1],
             boundaries=[2048, 4096, 8192],
             shuffle=True,
             seed=args.seed,
@@ -372,7 +425,7 @@ def main():
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         shuffle=False,
         collate_fn=collate_fn,
     )
@@ -436,6 +489,8 @@ def main():
             scheduler=scheduler,
             criterion=criterion,
             device=device,
+            scaler=scaler,
+            use_amp=use_amp,
             accum_steps=args.accum_steps,
             max_batches=args.max_train_batches,
             vocab_size=vocab_size,
@@ -443,6 +498,9 @@ def main():
             wandb_run=wandb_run,
         )
         train_losses.append(train_loss)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Validation loss
         val_loss = evaluate_loss(
@@ -452,6 +510,7 @@ def main():
             device=device,
             vocab_size=vocab_size,
             max_batches=args.max_val_batches,
+            use_amp=use_amp,
         )
         val_losses.append(val_loss)
 
@@ -463,7 +522,11 @@ def main():
             tokenizer=tokenizer,
             device=device,
             num_examples=args.eval_samples,
+            use_amp=use_amp,
         )
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         for k in metric_history:
             metric_history[k].append(metrics.get(k, 0.0))
