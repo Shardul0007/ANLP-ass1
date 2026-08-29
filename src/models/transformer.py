@@ -118,7 +118,7 @@ class BinaryToTextTransformer(nn.Module):
         d_ff=1024,
         num_layers=2,
         max_cipher_length=12000,
-        max_text_length=512,
+        max_text_length=1024,
         dropout=0.1,
     ):
         super().__init__()
@@ -417,7 +417,7 @@ if __name__ == "__main__":
         d_ff=1024,
         num_layers=2,
         max_cipher_length=512,
-        max_text_length=128,
+        max_text_length=1024,
     )
 
     cipher = torch.randint(

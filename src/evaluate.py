@@ -77,7 +77,7 @@ model = BinaryToTextTransformer(
     d_ff=D_FF,
     num_layers=NUM_LAYERS,
     max_cipher_length=MAX_CIPHER_LENGTH,
-    max_text_length=512,
+    max_text_length=1024,
 )
 
 

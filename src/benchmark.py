@@ -17,7 +17,7 @@ def benchmark(sequence_length):
         d_ff=1024,
         num_layers=2,
         max_cipher_length=sequence_length,
-        max_text_length=32,
+        max_text_length=1024,
         dropout=0.0,
     )
 
