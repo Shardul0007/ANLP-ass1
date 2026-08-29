@@ -15,7 +15,7 @@ from .tokenizer import load_tokenizer
 # Configuration
 # =========================================
 
-CHECKPOINT = "checkpoints/c1_epoch_1.pt"
+CHECKPOINT = "checkpoints/c1_best.pt"
 
 MAX_CIPHER_LENGTH = 4096
 
