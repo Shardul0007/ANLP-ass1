@@ -17,10 +17,21 @@ class LengthBucketBatchSampler(Sampler):
         self.shuffle = shuffle
         self.seed = seed
 
-        self.lengths = [
-            len(dataset.cipher_lines[i])
-            for i in range(len(dataset))
-        ]
+        if hasattr(dataset, "cipher_lines"):
+            self.lengths = [
+                len(dataset.cipher_lines[i])
+                for i in range(len(dataset))
+            ]
+        elif hasattr(dataset, "dataset") and hasattr(dataset.dataset, "cipher_lines"):
+            self.lengths = [
+                len(dataset.dataset.cipher_lines[dataset.indices[i]])
+                for i in range(len(dataset))
+            ]
+        else:
+            self.lengths = [
+                len(dataset[i]["cipher"])
+                for i in range(len(dataset))
+            ]
 
         self.buckets = self._create_buckets()
 

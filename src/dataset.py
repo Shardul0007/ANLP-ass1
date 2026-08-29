@@ -12,9 +12,11 @@ class BinaryToTextDataset(Dataset):
         cipher_file,
         plain_file,
         tokenizer_file="data/brown_tokenizer.json",
+        max_cipher_len=None,
     ):
         self.cipher_file = Path(cipher_file)
         self.plain_file = Path(plain_file)
+        self.max_cipher_len = max_cipher_len
 
         with open(self.cipher_file, "r", encoding="utf-8") as f:
             self.cipher_lines = [line.strip() for line in f]
@@ -57,12 +59,17 @@ class BinaryToTextDataset(Dataset):
         cipher = self.cipher_lines[index]
         plaintext = self.plain_lines[index]
 
-        # Binary input.
+        # Aligned truncation if max_cipher_len is set
+        if self.max_cipher_len is not None and len(cipher) > self.max_cipher_len:
+            max_bytes = self.max_cipher_len // 8
+            cipher = cipher[: max_bytes * 8]
+            plaintext = plaintext[:max_bytes]
+
+        # Binary input (list of 0s and 1s).
         cipher_ids = [int(bit) for bit in cipher]
 
         # Tokenize plaintext.
         encoded = self.tokenizer.encode(plaintext)
-
         token_ids = encoded.ids
 
         # Add BOS and EOS.
@@ -82,6 +89,7 @@ class BinaryToTextDataset(Dataset):
                 target,
                 dtype=torch.long,
             ),
+            "plain_text": plaintext,
         }
 
 
@@ -158,13 +166,16 @@ def collate_fn(batch):
 
         target_padding_mask[i, :length] = False
 
-    return {
+    result = {
         "cipher": padded_cipher,
         "cipher_padding_mask": cipher_padding_mask,
         "decoder_input": padded_decoder_input,
         "target": padded_target,
         "target_padding_mask": target_padding_mask,
     }
+    if "plain_text" in batch[0]:
+        result["plain_text"] = [item["plain_text"] for item in batch]
+    return result
 
 
 if __name__ == "__main__":

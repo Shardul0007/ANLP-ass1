@@ -1,564 +1,288 @@
+"""
+Evaluation script for Configuration 1 (C1: Base Transformer).
+Generates predictions using greedy decoding and computes all required assignment metrics:
+1. Bit-Level Accuracy (%)
+2. Sequence Accuracy (%)
+3. Levenshtein Distance
+4. BLEU Score
+5. ROUGE Scores (ROUGE-1, ROUGE-2, ROUGE-L)
+"""
+
+import argparse
+import os
+from pathlib import Path
+
 import torch
-from torch.utils.data import random_split
 
 from .dataset import BinaryToTextDataset
-from .models.masks import create_causal_mask
 from .models.transformer import BinaryToTextTransformer
 from .tokenizer import load_tokenizer
+from .training import split_dataset
+from .utils import compute_all_metrics
 
 
-# =========================================
-# Configuration
-# =========================================
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate C1 Transformer")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="checkpoints/c1_best.pt",
+        help="Path to checkpoint file",
+    )
+    parser.add_argument(
+        "--num_examples",
+        type=int,
+        default=50,
+        help="Number of validation examples to evaluate (or -1 for all)",
+    )
+    parser.add_argument(
+        "--max_cipher_len",
+        type=int,
+        default=8192,
+        help="Max cipher length in bits",
+    )
+    parser.add_argument(
+        "--max_gen_len",
+        type=int,
+        default=300,
+        help="Maximum generation length in tokens",
+    )
+    parser.add_argument(
+        "--d_model", type=int, default=256, help="Model hidden dimension"
+    )
+    parser.add_argument(
+        "--num_heads", type=int, default=8, help="Number of attention heads"
+    )
+    parser.add_argument(
+        "--d_ff", type=int, default=1024, help="FFN dimension"
+    )
+    parser.add_argument(
+        "--num_layers", type=int, default=2, help="Number of layers"
+    )
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        default="outputs/c1_eval_results.txt",
+        help="Path to save evaluation summary",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
-CHECKPOINT = "checkpoints/c1_best.pt"
-
-MAX_CIPHER_LENGTH = 4096
-MAX_GENERATION_LENGTH = 300
-
-MAX_EXAMPLES = 20
-
-VOCAB_SIZE = 8000
-
-D_MODEL = 256
-NUM_HEADS = 8
-D_FF = 1024
-NUM_LAYERS = 2
+    return parser.parse_args()
 
 
-# =========================================
-# Device
-# =========================================
+def detect_dims_from_checkpoint(checkpoint):
+    state_dict = checkpoint["model_state_dict"]
+    d_model = state_dict["output_projection.weight"].shape[1]
+    vocab_size = state_dict["output_projection.weight"].shape[0]
+    num_layers = sum(
+        1
+        for k in state_dict
+        if k.startswith("encoder.layers.") and k.endswith(".norm1.gamma")
+    )
 
-device = torch.device(
-    "cuda"
-    if torch.cuda.is_available()
-    else "cpu"
-)
+    d_ff = 1024
+    if "encoder.layers.0.ffn.linear1.weight" in state_dict:
+        d_ff = state_dict["encoder.layers.0.ffn.linear1.weight"].shape[0]
 
-print("Using device:", device)
+    max_cipher_len = 8192
+    if "encoder_position.positional_encoding" in state_dict:
+        max_cipher_len = state_dict[
+            "encoder_position.positional_encoding"
+        ].shape[1]
 
-if torch.cuda.is_available():
-    print(
-        "GPU:",
-        torch.cuda.get_device_name(0)
+    max_text_len = 1024
+    if "decoder_position.positional_encoding" in state_dict:
+        max_text_len = state_dict[
+            "decoder_position.positional_encoding"
+        ].shape[1]
+
+    return (
+        d_model,
+        vocab_size,
+        num_layers,
+        d_ff,
+        max_cipher_len,
+        max_text_len,
     )
 
 
-# =========================================
-# Tokenizer
-# =========================================
-
-tokenizer = load_tokenizer()
-
-BOS_ID = tokenizer.token_to_id("[BOS]")
-EOS_ID = tokenizer.token_to_id("[EOS]")
-
-print("BOS:", BOS_ID)
-print("EOS:", EOS_ID)
-
-
-# =========================================
-# Dataset
-# =========================================
-
-dataset = BinaryToTextDataset(
-    "data/brown_cipher.txt",
-    "data/brown_plain.txt",
-)
-
-train_size = int(
-    len(dataset) * 0.9
-)
-
-validation_size = (
-    len(dataset) - train_size
-)
-
-generator = torch.Generator().manual_seed(42)
-
-_, validation_dataset = random_split(
-    dataset,
-    [train_size, validation_size],
-    generator=generator,
-)
-
-
-# =========================================
-# Select COMPLETE validation examples
-# =========================================
-
-complete_examples = []
-
-for index in range(
-    len(validation_dataset)
-):
-
-    example = validation_dataset[index]
-
-    cipher_length = (
-        example["cipher"].size(0)
-    )
-
-    if cipher_length <= MAX_CIPHER_LENGTH:
-        complete_examples.append(
-            index
-        )
-
-
-print(
-    "\nComplete validation examples:",
-    len(complete_examples),
-)
-
-print(
-    "Total validation examples:",
-    len(validation_dataset),
-)
-
-print(
-    "Coverage:",
-    f"{100 * len(complete_examples) / len(validation_dataset):.2f}%"
-)
-
-
-# =========================================
-# Model
-# =========================================
-
-model = BinaryToTextTransformer(
-    vocab_size=VOCAB_SIZE,
-    d_model=D_MODEL,
-    num_heads=NUM_HEADS,
-    d_ff=D_FF,
-    num_layers=NUM_LAYERS,
-    max_cipher_length=MAX_CIPHER_LENGTH,
-    max_text_length=1024,
-).to(device)
-
-
-# =========================================
-# Load checkpoint
-# =========================================
-
-checkpoint = torch.load(
-    CHECKPOINT,
-    map_location=device,
-)
-
-model.load_state_dict(
-    checkpoint["model_state_dict"]
-)
-
-model.eval()
-
-print(
-    "Loaded checkpoint from epoch:",
-    checkpoint["epoch"],
-)
-
-print(
-    "Checkpoint validation loss:",
-    checkpoint["validation_loss"],
-)
-
-
-# =========================================
-# Aggregate metrics
-# =========================================
-
-total_correct = 0
-total_tokens = 0
-
-total_exact_matches = 0
-
-total_generated_tokens = 0
-total_target_tokens = 0
-
-generation_failures = 0
-
-
-# =========================================
-# Evaluate
-# =========================================
-
-num_examples = min(
-    MAX_EXAMPLES,
-    len(complete_examples),
-)
-
-print(
-    "\nEvaluating",
-    num_examples,
-    "complete examples..."
-)
-
-
-for example_number in range(
-    num_examples
-):
-
-    index = complete_examples[
-        example_number
-    ]
-
-    example = validation_dataset[
-        index
-    ]
-
-    print("\n" + "=" * 70)
-
-    print(
-        f"EXAMPLE {example_number + 1}"
-        f"/{num_examples}"
-    )
-
-    print("=" * 70)
-
-
-    # =====================================
-    # Cipher
-    # =====================================
-
-    cipher = (
-        example["cipher"]
-        .unsqueeze(0)
-        .to(device)
-    )
-
-    cipher_length = cipher.size(1)
-
-    print(
-        "\nCipher length:",
-        cipher_length,
-    )
-
-
-    # =====================================
-    # Target
-    # =====================================
-
-    target_cpu = example["target"]
-
-    target_ids = (
-        target_cpu
-        .tolist()
-    )
-
-    target_ids = [
-        token_id
-        for token_id in target_ids
-        if token_id != 0
-    ]
-
-    if EOS_ID in target_ids:
-
-        target_ids = target_ids[
-            :target_ids.index(EOS_ID)
-        ]
-
-
-    # =====================================
-    # Decoder input
-    # =====================================
-
-    decoder_input = (
-        example["decoder_input"]
-        .unsqueeze(0)
-        .to(device)
-    )
-
-    target = (
-        example["target"]
-        .unsqueeze(0)
-        .to(device)
-    )
-
-
-    # =====================================
-    # Masks
-    # =====================================
-
-    # No cipher padding because this is
-    # a single complete example.
-
-    cipher_padding_mask = torch.zeros(
+def main():
+    args = parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    tokenizer = load_tokenizer()
+    bos_id = tokenizer.token_to_id("[BOS]")
+    eos_id = tokenizer.token_to_id("[EOS]")
+
+    # Checkpoint path check
+    checkpoint_path = args.checkpoint
+    if not os.path.exists(checkpoint_path):
+        fallback = "checkpoints/c1_epoch_1.pt"
+        if os.path.exists(fallback):
+            print(f"Notice: {checkpoint_path} not found. Falling back to {fallback}")
+            checkpoint_path = fallback
+        else:
+            raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
+
+    print(f"Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Detect dimensions if possible
+    try:
         (
-            1,
-            1,
-            1,
-            cipher.size(1),
-        ),
-        dtype=torch.bool,
-        device=device,
+            d_model,
+            vocab_size,
+            num_layers,
+            d_ff,
+            max_cipher_len,
+            max_text_len,
+        ) = detect_dims_from_checkpoint(checkpoint)
+        print(
+            f"Detected from checkpoint: d_model={d_model}, d_ff={d_ff}, "
+            f"vocab={vocab_size}, layers={num_layers}, "
+            f"max_cipher_len={max_cipher_len}, max_text_len={max_text_len}"
+        )
+    except Exception:
+        d_model = args.d_model
+        d_ff = args.d_ff
+        vocab_size = tokenizer.get_vocab_size()
+        num_layers = args.num_layers
+        max_cipher_len = args.max_cipher_len
+        max_text_len = args.max_text_len
+
+    # Load validation dataset
+    dataset = BinaryToTextDataset(
+        "data/brown_cipher.txt",
+        "data/brown_plain.txt",
+        max_cipher_len=max_cipher_len,
     )
 
-    decoder_padding_mask = (
-        target == 0
-    ).unsqueeze(1).unsqueeze(2)
+    _, val_dataset = split_dataset(dataset, train_ratio=0.9, seed=args.seed)
+    total_val = len(val_dataset)
+    eval_count = total_val if args.num_examples < 0 else min(args.num_examples, total_val)
 
+    print(f"Total validation examples: {total_val} | Evaluating: {eval_count}")
 
-    # =====================================
-    # Teacher-forced evaluation
-    # =====================================
+    # Initialize model
+    model = BinaryToTextTransformer(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        num_heads=args.num_heads,
+        d_ff=d_ff,
+        num_layers=num_layers,
+        max_cipher_length=max_cipher_len,
+        max_text_length=max_text_len,
+    ).to(device)
 
-    with torch.no_grad():
+    # Load weights with shape-safe filtering
+    model_state = model.state_dict()
+    filtered_state = {}
+    for k, v in checkpoint["model_state_dict"].items():
+        if k in model_state:
+            if model_state[k].shape == v.shape:
+                filtered_state[k] = v
+            elif (
+                k == "binary_embedding.weight"
+                and v.shape[0] == 2
+                and model_state[k].shape[0] == 3
+                and v.shape[1] == model_state[k].shape[1]
+            ):
+                model_state[k][:2] = v
+                filtered_state[k] = model_state[k]
 
-        causal_mask = create_causal_mask(
-            decoder_input.size(1),
-            device,
+    model.load_state_dict(filtered_state, strict=False)
+    model.eval()
+
+    epoch = checkpoint.get("epoch", "N/A")
+    val_loss = checkpoint.get("validation_loss", "N/A")
+    print(f"Model loaded (Trained Epoch: {epoch}, Val Loss: {val_loss})")
+
+    targets = []
+    predictions = []
+
+    print("\nRunning greedy decoding...")
+    for i in range(eval_count):
+        item = val_dataset[i]
+        cipher = item["cipher"].unsqueeze(0).to(device)
+
+        if "plain_text" in item:
+            ref_text = item["plain_text"]
+        else:
+            tgt_ids = item["target"].tolist()
+            tgt_ids = [t for t in tgt_ids if t not in (0, eos_id)]
+            ref_text = tokenizer.decode(tgt_ids)
+
+        gen_tokens = model.generate(
+            cipher=cipher,
+            bos_token_id=bos_id,
+            eos_token_id=eos_id,
+            max_length=args.max_gen_len,
         )
 
-        output = model(
-            cipher,
-            decoder_input,
-            cipher_padding_mask=(
-                cipher_padding_mask
-            ),
-            decoder_self_attention_mask=(
-                causal_mask
-            ),
-            decoder_padding_mask=(
-                decoder_padding_mask
-            ),
-        )
+        gen_ids = gen_tokens[0].detach().cpu().tolist()
+        if gen_ids and gen_ids[0] == bos_id:
+            gen_ids = gen_ids[1:]
+        if eos_id in gen_ids:
+            gen_ids = gen_ids[: gen_ids.index(eos_id)]
 
-        logits = output["logits"]
+        pred_text = tokenizer.decode(gen_ids)
 
-        predictions = logits.argmax(
-            dim=-1
-        )
+        targets.append(ref_text)
+        predictions.append(pred_text)
 
+        if (i + 1) % 10 == 0 or (i + 1) == eval_count:
+            print(f"Processed {i + 1:3d}/{eval_count} examples...")
 
-    # =====================================
-    # Token accuracy
-    # =====================================
+    # Compute metrics
+    print("\nComputing evaluation metrics...")
+    metrics = compute_all_metrics(targets, predictions)
 
-    valid_positions = (
-        target != 0
-    )
+    # Print Report
+    header = "=" * 70
+    output_lines = [
+        header,
+        "CONFIGURATION C1: BASELINE EVALUATION REPORT",
+        header,
+        f"Checkpoint:            {checkpoint_path}",
+        f"Evaluated Examples:    {eval_count}",
+        f"Bit-Level Accuracy:    {metrics['bit_accuracy'] * 100:.2f}%",
+        f"Sequence Accuracy:     {metrics['sequence_accuracy'] * 100:.2f}%",
+        f"Levenshtein Distance:  {metrics['levenshtein_distance']:.2f}",
+        f"BLEU Score:            {metrics['bleu'] * 100:.2f}",
+        f"ROUGE-1:               {metrics['rouge1']:.4f}",
+        f"ROUGE-2:               {metrics['rouge2']:.4f}",
+        f"ROUGE-L:               {metrics['rougeL']:.4f}",
+        header,
+        "\nQUALITATIVE SAMPLES (First 3 Examples):",
+        header,
+    ]
 
-    correct = (
-        (
-            predictions[valid_positions]
-            == target[valid_positions]
-        )
-        .sum()
-        .item()
-    )
-
-    token_count = (
-        valid_positions
-        .sum()
-        .item()
-    )
-
-    accuracy = (
-        correct / token_count
-        if token_count > 0
-        else 0.0
-    )
-
-    total_correct += correct
-    total_tokens += token_count
-
-
-    # =====================================
-    # Autoregressive generation
-    # =====================================
-
-    with torch.no_grad():
-
-        generated = model.generate(
-            cipher,
-            bos_token_id=BOS_ID,
-            eos_token_id=EOS_ID,
-            max_length=MAX_GENERATION_LENGTH,
-        )
-
-
-    generated_ids = (
-        generated[0]
-        .detach()
-        .cpu()
-        .tolist()
-    )
-
-
-    # Remove BOS
-
-    if (
-        generated_ids
-        and generated_ids[0] == BOS_ID
-    ):
-
-        generated_ids = (
-            generated_ids[1:]
-        )
-
-
-    # Stop at EOS
-
-    if EOS_ID in generated_ids:
-
-        generated_ids = (
-            generated_ids[
-                :generated_ids.index(EOS_ID)
+    for idx in range(min(3, len(targets))):
+        output_lines.extend(
+            [
+                f"\n[Sample {idx + 1}]",
+                f"TARGET:     {targets[idx]}",
+                f"PREDICTION: {predictions[idx]}",
+                f"Levenshtein Dist: {levenshtein_distance(targets[idx], predictions[idx])}",
             ]
         )
 
-    else:
+    output_lines.append(header)
+    summary_text = "\n".join(output_lines)
+    print("\n" + summary_text)
 
-        generation_failures += 1
+    # Save to outputs
+    os.makedirs(Path(args.output_file).parent, exist_ok=True)
+    with open(args.output_file, "w", encoding="utf-8") as f:
+        f.write(summary_text)
 
-
-    # =====================================
-    # Exact match
-    # =====================================
-
-    exact_match = (
-        generated_ids
-        == target_ids
-    )
-
-    if exact_match:
-        total_exact_matches += 1
+    print(f"\nResults saved to: {args.output_file}")
 
 
-    # =====================================
-    # Length statistics
-    # =====================================
-
-    total_target_tokens += len(
-        target_ids
-    )
-
-    total_generated_tokens += len(
-        generated_ids
-    )
-
-
-    # =====================================
-    # Decode
-    # =====================================
-
-    original_text = tokenizer.decode(
-        target_ids
-    )
-
-    generated_text = tokenizer.decode(
-        generated_ids
-    )
-
-
-    # =====================================
-    # Print
-    # =====================================
-
-    print(
-        "\nTeacher-forced accuracy:",
-        f"{accuracy * 100:.2f}%"
-    )
-
-    print("\nORIGINAL:")
-    print(original_text)
-
-    print("\nGENERATED:")
-    print(generated_text)
-
-    print(
-        "\nTarget tokens:",
-        len(target_ids),
-    )
-
-    print(
-        "Generated tokens:",
-        len(generated_ids),
-    )
-
-    print(
-        "Exact match:",
-        exact_match,
-    )
-
-
-# =========================================
-# Final summary
-# =========================================
-
-overall_accuracy = (
-    total_correct / total_tokens
-    if total_tokens > 0
-    else 0.0
-)
-
-average_target_length = (
-    total_target_tokens / num_examples
-    if num_examples > 0
-    else 0.0
-)
-
-average_generated_length = (
-    total_generated_tokens / num_examples
-    if num_examples > 0
-    else 0.0
-)
-
-exact_match_rate = (
-    total_exact_matches / num_examples
-    if num_examples > 0
-    else 0.0
-)
-
-generation_failure_rate = (
-    generation_failures / num_examples
-    if num_examples > 0
-    else 0.0
-)
-
-
-print("\n\n" + "=" * 70)
-print("C1 — COMPLETE-INPUT EVALUATION")
-print("=" * 70)
-
-print(
-    "Examples evaluated:",
-    num_examples,
-)
-
-print(
-    "Teacher-forced token accuracy:",
-    f"{overall_accuracy * 100:.2f}%"
-)
-
-print(
-    "Average target length:",
-    f"{average_target_length:.2f}"
-)
-
-print(
-    "Average generated length:",
-    f"{average_generated_length:.2f}"
-)
-
-print(
-    "Exact matches:",
-    f"{total_exact_matches}/{num_examples}"
-)
-
-print(
-    "Exact match rate:",
-    f"{exact_match_rate * 100:.2f}%"
-)
-
-print(
-    "Generation hit max length:",
-    f"{generation_failures}/{num_examples}"
-)
-
-print(
-    "Generation failure rate:",
-    f"{generation_failure_rate * 100:.2f}%"
-)
-
-print("=" * 70)
+if __name__ == "__main__":
+    from .utils import levenshtein_distance
+    main()

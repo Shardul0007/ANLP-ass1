@@ -7,6 +7,7 @@ from .decoder import DecoderLayer
 from .encoder import EncoderLayer
 from .positional import SinusoidalPositionalEncoding
 from .masks import create_causal_mask
+from .norm import LayerNorm
 
 class Encoder(nn.Module):
     def __init__(
@@ -129,14 +130,17 @@ class BinaryToTextTransformer(nn.Module):
         # Embeddings
         # =========================================
 
+        # Vocab: 0='0', 1='1', 2='[PAD]'
         self.binary_embedding = nn.Embedding(
-            num_embeddings=2,
+            num_embeddings=3,
             embedding_dim=d_model,
+            padding_idx=2,
         )
 
         self.text_embedding = nn.Embedding(
             num_embeddings=vocab_size,
             embedding_dim=d_model,
+            padding_idx=0,
         )
 
         # =========================================
@@ -168,6 +172,7 @@ class BinaryToTextTransformer(nn.Module):
             d_ff=d_ff,
             dropout=dropout,
         )
+        self.encoder_norm = LayerNorm(d_model)
 
         # =========================================
         # Decoder
@@ -180,6 +185,7 @@ class BinaryToTextTransformer(nn.Module):
             d_ff=d_ff,
             dropout=dropout,
         )
+        self.decoder_norm = LayerNorm(d_model)
 
         # =========================================
         # Vocabulary projection
@@ -227,6 +233,7 @@ class BinaryToTextTransformer(nn.Module):
                 padding_mask=cipher_padding_mask,
             )
         )
+        encoder_output = self.encoder_norm(encoder_output)
 
         # =========================================
         # Decoder
@@ -273,6 +280,7 @@ class BinaryToTextTransformer(nn.Module):
                 cross_attention_mask=cipher_padding_mask,
             )
         )
+        decoder_output = self.decoder_norm(decoder_output)
 
         # =========================================
         # Vocabulary prediction
@@ -298,7 +306,7 @@ class BinaryToTextTransformer(nn.Module):
         cipher_padding_mask=None,
     ):
         """
-        Autoregressively generate plaintext token IDs.
+        Autoregressively generate plaintext token IDs using greedy decoding.
 
         cipher:
             [batch, cipher_length]
@@ -308,6 +316,12 @@ class BinaryToTextTransformer(nn.Module):
         """
 
         self.eval()
+
+        # Format mask if needed
+        if cipher_padding_mask is not None and cipher_padding_mask.dim() == 2:
+            cipher_padding_mask = (
+                cipher_padding_mask.unsqueeze(1).unsqueeze(2)
+            )
 
         # =========================================
         # Encoder
@@ -328,6 +342,7 @@ class BinaryToTextTransformer(nn.Module):
             encoder_x,
             padding_mask=cipher_padding_mask,
         )
+        encoder_output = self.encoder_norm(encoder_output)
 
         # =========================================
         # Start with BOS
@@ -377,6 +392,7 @@ class BinaryToTextTransformer(nn.Module):
                 self_attention_mask=causal_mask,
                 cross_attention_mask=cipher_padding_mask,
             )
+            decoder_output = self.decoder_norm(decoder_output)
 
             # Only need prediction for the newest token.
             last_hidden = decoder_output[:, -1, :]

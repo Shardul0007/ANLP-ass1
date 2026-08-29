@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, num_heads):
+    def __init__(self, d_model, num_heads, dropout=0.0):
         super().__init__()
 
         if d_model % num_heads != 0:
@@ -38,7 +38,7 @@ class MultiHeadAttention(nn.Module):
             d_model,
         )
 
-        self.attention = ScaledDotProductAttention()
+        self.attention = ScaledDotProductAttention(dropout=dropout)
 
     def split_heads(self, x):
         """
@@ -132,8 +132,9 @@ class MultiHeadAttention(nn.Module):
         return output, attention_weights
 
 class ScaledDotProductAttention(nn.Module):
-    def __init__(self):
+    def __init__(self, dropout=0.0):
         super().__init__()
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
     def forward(
         self,
@@ -166,11 +167,11 @@ class ScaledDotProductAttention(nn.Module):
         # 2. Scale by sqrt(d_k)
         scores = scores / math.sqrt(head_dim)
 
-        # 3. Apply mask if provided
+        # 3. Apply mask if provided (safe masked_fill)
         if mask is not None:
             scores = scores.masked_fill(
                 mask,
-                float("-inf"),
+                -1e9,
             )
 
         # 4. Convert scores to probabilities
@@ -179,13 +180,69 @@ class ScaledDotProductAttention(nn.Module):
             dim=-1,
         )
 
+        attention_weights_dropped = self.dropout(attention_weights)
+
         # 5. Weighted sum of values
         output = torch.matmul(
-            attention_weights,
+            attention_weights_dropped,
             value,
         )
 
         return output, attention_weights
+
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, d_model, num_heads, num_kv_heads, dropout=0.0):
+        super().__init__()
+
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.num_queries_per_kv = num_heads // num_kv_heads
+        self.head_dim = d_model // num_heads
+
+        self.q_projection = nn.Linear(d_model, d_model)
+        self.k_projection = nn.Linear(d_model, self.num_kv_heads * self.head_dim)
+        self.v_projection = nn.Linear(d_model, self.num_kv_heads * self.head_dim)
+        self.output_projection = nn.Linear(d_model, d_model)
+
+        self.attention = ScaledDotProductAttention(dropout=dropout)
+
+    def split_heads(self, x, num_heads):
+        batch_size, sequence_length, _ = x.shape
+        x = x.view(batch_size, sequence_length, num_heads, self.head_dim)
+        return x.transpose(1, 2)
+
+    def forward(self, query, key, value, mask=None):
+        q = self.q_projection(query)
+        k = self.k_projection(key)
+        v = self.v_projection(value)
+
+        q = self.split_heads(q, self.num_heads)
+        k = self.split_heads(k, self.num_kv_heads)
+        v = self.split_heads(v, self.num_kv_heads)
+
+        # Repeat KV heads to match query heads
+        if self.num_queries_per_kv > 1:
+            k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
+            v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
+
+        attention_output, attention_weights = self.attention(q, k, v, mask=mask)
+
+        # Combine heads
+        batch_size, _, sequence_length, _ = attention_output.shape
+        attention_output = (
+            attention_output.transpose(1, 2)
+            .contiguous()
+            .view(batch_size, sequence_length, self.d_model)
+        )
+
+        return self.output_projection(attention_output), attention_weights
 
 
 if __name__ == "__main__":

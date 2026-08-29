@@ -22,6 +22,7 @@ class EncoderLayer(nn.Module):
         self.self_attention = MultiHeadAttention(
             d_model=d_model,
             num_heads=num_heads,
+            dropout=dropout,
         )
 
         self.ffn = FeedForwardNetwork(
