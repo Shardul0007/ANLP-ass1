@@ -20,6 +20,7 @@ from .bucketing import LengthBucketBatchSampler
 from .dataset import BinaryToTextDataset, collate_fn
 from .models.masks import create_causal_mask
 from .models.transformer import BinaryToTextTransformer
+from .models.blt import ByteLatentTransformer, byte_ids_to_string, NUM_BYTE_CLASSES
 from .training import save_checkpoint, split_dataset
 from .utils import compute_all_metrics, plot_training_curves
 
@@ -340,11 +341,16 @@ def evaluate_generation_metrics(
     use_amp=False,
     repetition_penalty=1.0,
     no_repeat_ngram_size=0,
+    is_token_free=False,
 ):
     """Runs greedy decoding and computes assignment metrics on validation examples."""
     model.eval()
-    bos_id = tokenizer.token_to_id("[BOS]")
-    eos_id = tokenizer.token_to_id("[EOS]")
+    if not is_token_free and tokenizer is not None:
+        bos_id = tokenizer.token_to_id("[BOS]")
+        eos_id = tokenizer.token_to_id("[EOS]")
+    else:
+        bos_id = 1
+        eos_id = 2
 
     eval_indices = list(range(min(num_examples, len(validation_dataset))))
     target_texts = []
@@ -360,26 +366,36 @@ def evaluate_generation_metrics(
         else:
             tgt_ids = item["target"].tolist()
             tgt_ids = [t for t in tgt_ids if t not in (0, eos_id)]
-            ref_text = tokenizer.decode(tgt_ids)
+            ref_text = tokenizer.decode(tgt_ids) if tokenizer else ""
 
         # Greedy decoding
         with get_autocast(device.type, use_amp):
-            gen_tokens = model.generate(
-                cipher=cipher,
-                bos_token_id=bos_id,
-                eos_token_id=eos_id,
-                max_length=max_gen_len,
-                repetition_penalty=repetition_penalty,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-            )
-
-        gen_ids = gen_tokens[0].detach().cpu().tolist()
-        if gen_ids and gen_ids[0] == bos_id:
-            gen_ids = gen_ids[1:]
-        if eos_id in gen_ids:
-            gen_ids = gen_ids[: gen_ids.index(eos_id)]
-
-        pred_text = tokenizer.decode(gen_ids)
+            if is_token_free:
+                gen_tokens = model.generate(
+                    cipher=cipher,
+                    max_length_bytes=max_gen_len,
+                    bos_byte_id=bos_id,
+                    eos_byte_id=eos_id,
+                    repetition_penalty=repetition_penalty,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                )
+                gen_ids = gen_tokens[0].detach().cpu().tolist()
+                pred_text = byte_ids_to_string(gen_ids)
+            else:
+                gen_tokens = model.generate(
+                    cipher=cipher,
+                    bos_token_id=bos_id,
+                    eos_token_id=eos_id,
+                    max_length=max_gen_len,
+                    repetition_penalty=repetition_penalty,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                )
+                gen_ids = gen_tokens[0].detach().cpu().tolist()
+                if gen_ids and gen_ids[0] == bos_id:
+                    gen_ids = gen_ids[1:]
+                if eos_id in gen_ids:
+                    gen_ids = gen_ids[: gen_ids.index(eos_id)]
+                pred_text = tokenizer.decode(gen_ids)
 
         target_texts.append(ref_text)
         pred_texts.append(pred_text)
@@ -404,6 +420,7 @@ def main():
 
     # Map configuration ablation settings (Table 1)
     cfg = args.config.lower()
+    is_token_free = (cfg == "c5")
     if cfg == "c1":
         pos_encoding = "sinusoidal"
         attention_type = "mha"
@@ -424,6 +441,11 @@ def main():
         attention_type = "mha"
         norm_type = "rmsnorm"
         default_name = "C4-RMSNorm"
+    elif cfg == "c5":
+        pos_encoding = "sinusoidal"
+        attention_type = "mha"
+        norm_type = "layernorm"
+        default_name = "C5-BLT"
     else:
         pos_encoding = "sinusoidal"
         attention_type = "mha"
@@ -436,6 +458,7 @@ def main():
         f"\nPositional Encoding: {pos_encoding}"
         f"\nAttention Type:      {attention_type}"
         f"\nNorm Type:            {norm_type}"
+        f"\nToken-Free BLT:      {is_token_free}"
     )
 
     # Initialize WandB if requested
@@ -460,9 +483,10 @@ def main():
         "data/brown_cipher.txt",
         "data/brown_plain.txt",
         max_cipher_len=args.max_cipher_len,
+        token_free=is_token_free,
     )
     tokenizer = full_dataset.tokenizer
-    vocab_size = tokenizer.get_vocab_size()
+    vocab_size = NUM_BYTE_CLASSES if is_token_free else tokenizer.get_vocab_size()
     print(f"Total dataset size: {len(full_dataset)} | Vocab size: {vocab_size}")
 
     train_dataset, val_dataset = split_dataset(
@@ -503,20 +527,30 @@ def main():
     )
 
     # 3. Model
-    model = BinaryToTextTransformer(
-        vocab_size=vocab_size,
-        d_model=args.d_model,
-        num_heads=args.num_heads,
-        d_ff=args.d_ff,
-        num_layers=args.num_layers,
-        max_cipher_length=args.max_cipher_len,
-        max_text_length=args.max_text_len,
-        dropout=args.dropout,
-        pos_encoding=pos_encoding,
-        attention_type=attention_type,
-        norm_type=norm_type,
-        num_kv_heads=args.num_kv_heads,
-    ).to(device)
+    if is_token_free:
+        model = ByteLatentTransformer(
+            d_model=args.d_model,
+            num_heads=args.num_heads,
+            d_ff=args.d_ff,
+            num_layers=args.num_layers,
+            patch_size_bytes=4,
+            dropout=args.dropout,
+        ).to(device)
+    else:
+        model = BinaryToTextTransformer(
+            vocab_size=vocab_size,
+            d_model=args.d_model,
+            num_heads=args.num_heads,
+            d_ff=args.d_ff,
+            num_layers=args.num_layers,
+            max_cipher_length=args.max_cipher_len,
+            max_text_length=args.max_text_len,
+            dropout=args.dropout,
+            pos_encoding=pos_encoding,
+            attention_type=attention_type,
+            norm_type=norm_type,
+            num_kv_heads=args.num_kv_heads,
+        ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -601,6 +635,7 @@ def main():
             use_amp=use_amp,
             repetition_penalty=args.repetition_penalty,
             no_repeat_ngram_size=args.no_repeat_ngram_size,
+            is_token_free=is_token_free,
         )
 
         if torch.cuda.is_available():
@@ -622,7 +657,8 @@ def main():
         if targets and preds:
             print("\n[Sample 1]")
             print(f"TARGET: {targets[0][:120]}...")
-            print(f"PRED:   {preds[0][:120]}...")
+            safe_pred = preds[0][:120].encode("ascii", errors="replace").decode("ascii")
+            print(f"PRED:   {safe_pred}...")
 
         # WandB logging
         if wandb_run is not None:

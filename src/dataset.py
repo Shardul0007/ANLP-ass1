@@ -13,10 +13,12 @@ class BinaryToTextDataset(Dataset):
         plain_file,
         tokenizer_file="data/brown_tokenizer.json",
         max_cipher_len=None,
+        token_free=False,
     ):
         self.cipher_file = Path(cipher_file)
         self.plain_file = Path(plain_file)
         self.max_cipher_len = max_cipher_len
+        self.token_free = token_free
 
         with open(self.cipher_file, "r", encoding="utf-8") as f:
             self.cipher_lines = [line.strip() for line in f]
@@ -45,12 +47,17 @@ class BinaryToTextDataset(Dataset):
                     f"Invalid character in cipher sequence at line {i}"
                 )
 
-        self.tokenizer = load_tokenizer(tokenizer_file)
-
-        self.pad_id = self.tokenizer.token_to_id("[PAD]")
-        self.unk_id = self.tokenizer.token_to_id("[UNK]")
-        self.bos_id = self.tokenizer.token_to_id("[BOS]")
-        self.eos_id = self.tokenizer.token_to_id("[EOS]")
+        if not self.token_free:
+            self.tokenizer = load_tokenizer(tokenizer_file)
+            self.pad_id = self.tokenizer.token_to_id("[PAD]")
+            self.unk_id = self.tokenizer.token_to_id("[UNK]")
+            self.bos_id = self.tokenizer.token_to_id("[BOS]")
+            self.eos_id = self.tokenizer.token_to_id("[EOS]")
+        else:
+            self.tokenizer = None
+            self.pad_id = 0  # [PAD]
+            self.bos_id = 1  # [BOS]
+            self.eos_id = 2  # [EOS]
 
     def __len__(self):
         return len(self.cipher_lines)
@@ -68,13 +75,16 @@ class BinaryToTextDataset(Dataset):
         # Binary input (list of 0s and 1s).
         cipher_ids = [int(bit) for bit in cipher]
 
-        # Tokenize plaintext.
-        encoded = self.tokenizer.encode(plaintext)
-        token_ids = encoded.ids
-
-        # Add BOS and EOS.
-        decoder_input = [self.bos_id] + token_ids
-        target = token_ids + [self.eos_id]
+        if self.token_free:
+            raw_bytes = list(plaintext.encode("utf-8"))
+            byte_ids = [b + 3 for b in raw_bytes]
+            decoder_input = [self.bos_id] + byte_ids
+            target = byte_ids + [self.eos_id]
+        else:
+            encoded = self.tokenizer.encode(plaintext)
+            token_ids = encoded.ids
+            decoder_input = [self.bos_id] + token_ids
+            target = token_ids + [self.eos_id]
 
         return {
             "cipher": torch.tensor(
@@ -90,6 +100,7 @@ class BinaryToTextDataset(Dataset):
                 dtype=torch.long,
             ),
             "plain_text": plaintext,
+            "token_free": self.token_free,
         }
 
 
@@ -110,10 +121,18 @@ def collate_fn(batch):
     # Cipher padding
     # -------------------------
 
+    is_token_free = batch[0].get("token_free", False)
+    patch_size = 4
+    patch_bits = patch_size * 8
+
     max_cipher_length = max(
         len(sequence)
         for sequence in cipher_sequences
     )
+    if is_token_free:
+        rem_c = max_cipher_length % patch_bits
+        if rem_c != 0:
+            max_cipher_length += (patch_bits - rem_c)
 
     padded_cipher = torch.full(
         (len(batch), max_cipher_length),
@@ -140,6 +159,10 @@ def collate_fn(batch):
         len(sequence)
         for sequence in decoder_inputs
     )
+    if is_token_free:
+        rem_t = max_target_length % patch_size
+        if rem_t != 0:
+            max_target_length += (patch_size - rem_t)
 
     padded_decoder_input = torch.full(
         (len(batch), max_target_length),
