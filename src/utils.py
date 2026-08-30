@@ -123,13 +123,11 @@ def sentence_bleu(reference: str, hypothesis: str, max_n: int = 4) -> float:
 
         total_hyp = sum(hyp_ngrams.values())
         if total_hyp == 0:
-            precisions.append(0.0)
-            continue
-
-        clipped = sum(min(count, ref_ngrams[ngram]) for ngram, count in hyp_ngrams.items())
-        # Add 0.1 smoothing for zero precision
-        precision = (clipped + 0.1) / (total_hyp + 0.1)
-        precisions.append(precision)
+            precision = 1e-8
+        else:
+            clipped = sum(min(count, ref_ngrams[ngram]) for ngram, count in hyp_ngrams.items())
+            precision = (clipped + 0.1) / (total_hyp + 0.1)
+        precisions.append(max(precision, 1e-8))
 
     log_sum = sum(math.log(p) for p in precisions) / max_n
     geometric_mean = math.exp(log_sum)
