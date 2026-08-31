@@ -1,0 +1,10 @@
+torch>=2.0.0
+tokenizers>=0.13.0
+matplotlib>=3.5.0
+numpy>=1.20.0
+Levenshtein>=0.20.0
+sacrebleu>=2.3.0
+rouge-score>=0.1.2
+python-dotenv>=1.0.0
+huggingface-hub>=0.15.0
+wandb>=0.15.0

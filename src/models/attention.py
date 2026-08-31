@@ -1,339 +1,161 @@
 import math
-
+from typing import Optional
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from .positional import (
-    RotaryPositionEmbedding,
-    apply_rotary_pos_emb,
-    apply_rotary_pos_emb_single,
-)
+from .positional import apply_rope
+
+
+def scaled_dot_product_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    dropout: Optional[nn.Dropout] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scaled dot-product attention: softmax(QK^T / sqrt(d_k)) V.
+
+    Args:
+        q: (batch, num_heads, seq_len_q, d_k)
+        k: (batch, num_heads, seq_len_k, d_k)
+        v: (batch, num_heads, seq_len_k, d_v)
+        mask: additive mask — positions with large negative values are masked out.
+              Shape broadcastable to (batch, num_heads, seq_len_q, seq_len_k).
+        dropout: optional dropout applied to attention weights.
+
+    Returns:
+        (output, attention_weights)
+    """
+    d_k = q.size(-1)
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
+
+    if mask is not None:
+        scores = scores + mask
+
+    attn_weights = F.softmax(scores, dim=-1)
+
+    if dropout is not None:
+        attn_weights = dropout(attn_weights)
+
+    output = torch.matmul(attn_weights, v)
+    return output, attn_weights
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, num_heads, dropout=0.0, use_rope=False, max_len=8192):
-        super().__init__()
+    """Standard Multi-Head Attention (Vaswani et al., 2017) from scratch.
 
-        if d_model % num_heads != 0:
-            raise ValueError(
-                "d_model must be divisible by num_heads"
-            )
+    Supports self-attention and cross-attention.
+    Optionally applies RoPE to Q and K when rope_cos/rope_sin are provided.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
 
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-        self.use_rope = use_rope
 
-        if use_rope:
-            self.rope = RotaryPositionEmbedding(dim=self.head_dim, max_len=max_len)
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
 
-        # Learned projections for Q, K and V.
-        self.q_projection = nn.Linear(
-            d_model,
-            d_model,
-        )
-
-        self.k_projection = nn.Linear(
-            d_model,
-            d_model,
-        )
-
-        self.v_projection = nn.Linear(
-            d_model,
-            d_model,
-        )
-
-        # Final projection after concatenating heads.
-        self.output_projection = nn.Linear(
-            d_model,
-            d_model,
-        )
-
-        self.attention = ScaledDotProductAttention(dropout=dropout)
-
-    def split_heads(self, x):
-        """
-        x:
-            [batch, sequence_length, d_model]
-
-        returns:
-            [batch, num_heads, sequence_length, head_dim]
-        """
-
-        batch_size, sequence_length, _ = x.shape
-
-        x = x.view(
-            batch_size,
-            sequence_length,
-            self.num_heads,
-            self.head_dim,
-        )
-
-        x = x.transpose(1, 2)
-
-        return x
-
-    def combine_heads(self, x):
-        """
-        x:
-            [batch, num_heads, sequence_length, head_dim]
-
-        returns:
-            [batch, sequence_length, d_model]
-        """
-
-        batch_size, num_heads, sequence_length, head_dim = x.shape
-
-        x = x.transpose(1, 2)
-
-        x = x.contiguous().view(
-            batch_size,
-            sequence_length,
-            self.d_model,
-        )
-
-        return x
+        self.dropout = nn.Dropout(p=dropout)
 
     def forward(
         self,
-        query,
-        key,
-        value,
-        mask=None,
-        need_weights=False,
-    ):
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        query:
-            [batch, query_length, d_model]
+        Args:
+            query: (batch, seq_len_q, d_model)
+            key:   (batch, seq_len_k, d_model)
+            value: (batch, seq_len_k, d_model)
+            mask:  additive mask, broadcastable to (batch, heads, seq_q, seq_k)
+            rope_cos, rope_sin: precomputed RoPE tables, shape (max_len, head_dim).
 
-        key:
-            [batch, key_length, d_model]
-
-        value:
-            [batch, key_length, d_model]
+        Returns:
+            (batch, seq_len_q, d_model)
         """
+        batch_size = query.size(0)
 
-        # 1. Project inputs into Q, K and V.
-        q = self.q_projection(query)
-        k = self.k_projection(key)
-        v = self.v_projection(value)
+        # Project and reshape: (batch, seq, d_model) -> (batch, heads, seq, head_dim)
+        q = self.W_q(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.W_k(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.W_v(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # 2. Split into multiple heads.
-        q = self.split_heads(q)
-        k = self.split_heads(k)
-        v = self.split_heads(v)
+        if rope_cos is not None and rope_sin is not None:
+            q, k = apply_rope(q, k, rope_cos, rope_sin)
 
-        # 2b. Apply Rotary Position Embedding (RoPE) if enabled
-        if self.use_rope:
-            if q.size(-2) == k.size(-2):
-                cos, sin = self.rope(q)
-                q, k = apply_rotary_pos_emb(q, k, cos, sin)
-            else:
-                cos_q, sin_q = self.rope(q)
-                cos_k, sin_k = self.rope(k)
-                q = apply_rotary_pos_emb_single(q, cos_q, sin_q)
-                k = apply_rotary_pos_emb_single(k, cos_k, sin_k)
+        attn_output, _ = scaled_dot_product_attention(q, k, v, mask=mask, dropout=self.dropout)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
 
-        # 3. Perform scaled dot-product attention.
-        attention_output, attention_weights = self.attention(
-            q,
-            k,
-            v,
-            mask,
-            need_weights=need_weights,
-        )
-
-        # 4. Combine heads.
-        attention_output = self.combine_heads(
-            attention_output
-        )
-
-        # 5. Final learned projection.
-        output = self.output_projection(
-            attention_output
-        )
-
-        return output, attention_weights
-
-class ScaledDotProductAttention(nn.Module):
-    def __init__(self, dropout=0.0, chunk_size=1024):
-        super().__init__()
-        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
-        self.chunk_size = chunk_size
-
-    def _compute_chunk(self, query, key, value, mask=None, need_weights=False):
-        head_dim = query.size(-1)
-
-        scores = torch.matmul(
-            query,
-            key.transpose(-2, -1),
-        )
-        scores = scores / math.sqrt(head_dim)
-
-        if mask is not None:
-            fill_value = -1e4 if scores.dtype == torch.float16 else -1e9
-            scores = scores.masked_fill(
-                mask,
-                fill_value,
-            )
-
-        attention_weights = torch.softmax(
-            scores,
-            dim=-1,
-        )
-        del scores
-
-        attention_weights_dropped = self.dropout(attention_weights)
-
-        output = torch.matmul(
-            attention_weights_dropped,
-            value,
-        )
-
-        if need_weights:
-            return output, attention_weights
-        return output, None
-
-    def forward(
-        self,
-        query,
-        key,
-        value,
-        mask=None,
-        need_weights=False,
-    ):
-        """
-        query: [batch, heads, query_length, head_dim]
-        key:   [batch, heads, key_length, head_dim]
-        value: [batch, heads, key_length, head_dim]
-        """
-        q_len = query.size(-2)
-
-        # Fast path for standard length or when chunking is not beneficial
-        if q_len <= self.chunk_size:
-            return self._compute_chunk(query, key, value, mask, need_weights=need_weights)
-
-        # Memory-efficient chunked computation across query dimension:
-        # Splits query into blocks of chunk_size to keep peak attention memory small
-        outputs = []
-        weights = [] if need_weights else None
-
-        for i in range(0, q_len, self.chunk_size):
-            q_chunk = query[:, :, i : i + self.chunk_size, :]
-            m_chunk = (
-                mask[:, :, i : i + self.chunk_size, :]
-                if mask is not None and mask.size(-2) > 1
-                else mask
-            )
-            out_c, w_c = self._compute_chunk(
-                q_chunk, key, value, m_chunk, need_weights=need_weights
-            )
-            outputs.append(out_c)
-            if need_weights and w_c is not None:
-                weights.append(w_c)
-
-        output = torch.cat(outputs, dim=-2)
-        total_weights = torch.cat(weights, dim=-2) if need_weights else None
-
-        return output, total_weights
+        return self.W_o(attn_output)
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model, num_heads, num_kv_heads, dropout=0.0, chunk_size=1024):
-        super().__init__()
+    """Grouped-Query Attention (Ainslie et al., 2023) from scratch.
 
-        if d_model % num_heads != 0:
-            raise ValueError("d_model must be divisible by num_heads")
-        if num_heads % num_kv_heads != 0:
-            raise ValueError("num_heads must be divisible by num_kv_heads")
+    Uses fewer KV heads than query heads: num_query_heads query heads share
+    num_kv_heads key/value heads. Each KV head serves (num_query_heads // num_kv_heads)
+    query heads.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_query_heads: int,
+        num_kv_heads: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        assert d_model % num_query_heads == 0, f"d_model ({d_model}) must be divisible by num_query_heads ({num_query_heads})"
+        assert num_query_heads % num_kv_heads == 0, f"num_query_heads ({num_query_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
 
         self.d_model = d_model
-        self.num_heads = num_heads
+        self.num_query_heads = num_query_heads
         self.num_kv_heads = num_kv_heads
-        self.num_queries_per_kv = num_heads // num_kv_heads
-        self.head_dim = d_model // num_heads
+        self.head_dim = d_model // num_query_heads
+        self.groups = num_query_heads // num_kv_heads
 
-        self.q_projection = nn.Linear(d_model, d_model)
-        self.k_projection = nn.Linear(d_model, self.num_kv_heads * self.head_dim)
-        self.v_projection = nn.Linear(d_model, self.num_kv_heads * self.head_dim)
-        self.output_projection = nn.Linear(d_model, d_model)
+        self.W_q = nn.Linear(d_model, num_query_heads * self.head_dim)
+        self.W_k = nn.Linear(d_model, num_kv_heads * self.head_dim)
+        self.W_v = nn.Linear(d_model, num_kv_heads * self.head_dim)
+        self.W_o = nn.Linear(d_model, d_model)
 
-        self.attention = ScaledDotProductAttention(dropout=dropout, chunk_size=chunk_size)
+        self.dropout = nn.Dropout(p=dropout)
 
-    def split_heads(self, x, num_heads):
-        batch_size, sequence_length, _ = x.shape
-        x = x.view(batch_size, sequence_length, num_heads, self.head_dim)
-        return x.transpose(1, 2)
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Same signature as MultiHeadAttention.forward."""
+        batch_size = query.size(0)
 
-    def forward(self, query, key, value, mask=None, need_weights=False):
-        q = self.q_projection(query)
-        k = self.k_projection(key)
-        v = self.v_projection(value)
+        q = self.W_q(query).view(batch_size, -1, self.num_query_heads, self.head_dim).transpose(1, 2)
+        k = self.W_k(key).view(batch_size, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.W_v(value).view(batch_size, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        q = self.split_heads(q, self.num_heads)
-        k = self.split_heads(k, self.num_kv_heads)
-        v = self.split_heads(v, self.num_kv_heads)
+        if rope_cos is not None and rope_sin is not None:
+            q, k = apply_rope(q, k, rope_cos, rope_sin)
 
-        # Repeat KV heads to match query heads
-        if self.num_queries_per_kv > 1:
-            k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
-            v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
+        # Expand KV heads to match query heads
+        k = k.repeat_interleave(self.groups, dim=1)
+        v = v.repeat_interleave(self.groups, dim=1)
 
-        attention_output, attention_weights = self.attention(
-            q, k, v, mask=mask, need_weights=need_weights
-        )
+        attn_output, _ = scaled_dot_product_attention(q, k, v, mask=mask, dropout=self.dropout)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
 
-        # Combine heads
-        batch_size, _, sequence_length, _ = attention_output.shape
-        attention_output = (
-            attention_output.transpose(1, 2)
-            .contiguous()
-            .view(batch_size, sequence_length, self.d_model)
-        )
-
-        return self.output_projection(attention_output), attention_weights
-
-
-if __name__ == "__main__":
-    batch_size = 2
-    sequence_length = 10
-    d_model = 512
-    num_heads = 8
-
-    x = torch.randn(
-        batch_size,
-        sequence_length,
-        d_model,
-    )
-
-    mha = MultiHeadAttention(
-        d_model=d_model,
-        num_heads=num_heads,
-    )
-
-    output, weights = mha(
-        x,
-        x,
-        x,
-    )
-
-    print("Input shape:", x.shape)
-
-    print(
-        "Attention weights shape:",
-        weights.shape,
-    )
-
-    print("Output shape:", output.shape)
-
-    print("\nExpected:")
-    print(
-        "Weights:",
-        f"[{batch_size}, {num_heads}, "
-        f"{sequence_length}, {sequence_length}]",
-    )
-
-    print(
-        "Output:",
-        f"[{batch_size}, {sequence_length}, {d_model}]",
-    )
+        return self.W_o(attn_output)

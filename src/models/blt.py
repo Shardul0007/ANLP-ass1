@@ -1,389 +1,209 @@
 import math
-from typing import Optional, List, Tuple
-
+from typing import Optional
 import torch
 import torch.nn as nn
 
-from .attention import MultiHeadAttention
+from .attention import MultiHeadAttention, scaled_dot_product_attention
 from .norm import LayerNorm
 from .positional import SinusoidalPositionalEncoding
-from .masks import create_causal_mask
-from .encoder import EncoderLayer
-from .decoder import DecoderLayer
+from . import EncoderLayer, DecoderLayer
+
+BYTE_PAD = 256
+BYTE_BOS = 257
+BYTE_EOS = 258
+BYTE_VOCAB_SIZE = 259
 
 
-NUM_BYTE_CLASSES = 259  # 0: [PAD], 1: [BOS], 2: [EOS], 3..258: byte values 0..255
-PAD_BYTE_ID = 0
-BOS_BYTE_ID = 1
-EOS_BYTE_ID = 2
-
-
-def string_to_byte_ids(text: str, add_bos: bool = True, add_eos: bool = True) -> List[int]:
-    """Converts a string to byte IDs with offset + 3 for special tokens."""
-    raw = list(text.encode("utf-8"))
-    ids = [b + 3 for b in raw]
-    if add_bos:
-        ids = [BOS_BYTE_ID] + ids
-    if add_eos:
-        ids = ids + [EOS_BYTE_ID]
-    return ids
-
-
-def byte_ids_to_string(ids: List[int]) -> str:
-    """Decodes a list of byte IDs back to a UTF-8 string."""
-    raw = []
-    for token_id in ids:
-        if token_id == EOS_BYTE_ID:
-            break
-        if token_id >= 3:
-            raw.append(token_id - 3)
-    return bytes(raw).decode("utf-8", errors="replace")
-
-
-class LocalCipherEncoder(nn.Module):
-    """
-    Local Encoder for Ciphertext:
-    Groups raw cipher bits into patches of size (patch_size_bytes * 8) bits
-    and maps each bit-patch to a latent representation of dimension d_model.
-    """
-
-    def __init__(self, patch_size_bytes: int = 4, d_model: int = 256):
-        super().__init__()
-        self.patch_size_bits = patch_size_bytes * 8
-        self.d_model = d_model
-
-        # Bit embedding: 0, 1, and 2 for [PAD]
-        self.bit_emb = nn.Embedding(3, 16, padding_idx=2)
-        self.patch_proj = nn.Sequential(
-            nn.Linear(self.patch_size_bits * 16, d_model),
-            LayerNorm(d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-        )
-
-    def forward(self, cipher_bits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        cipher_bits: [batch, cipher_len_bits]
-        returns:
-            patch_latents: [batch, num_patches, d_model]
-            patch_padding_mask: [batch, 1, 1, num_patches]
-        """
-        batch_size, bit_len = cipher_bits.shape
-
-        # Pad bit_len to a multiple of patch_size_bits if needed
-        rem = bit_len % self.patch_size_bits
-        if rem != 0:
-            pad_amount = self.patch_size_bits - rem
-            pad_tensor = torch.full(
-                (batch_size, pad_amount), 2, dtype=torch.long, device=cipher_bits.device
-            )
-            cipher_bits = torch.cat([cipher_bits, pad_tensor], dim=1)
-            bit_len = cipher_bits.shape[1]
-
-        num_patches = bit_len // self.patch_size_bits
-
-        # Embed each bit
-        x = self.bit_emb(cipher_bits)  # [batch, bit_len, 16]
-        # Reshape to patches
-        x = x.view(batch_size, num_patches, self.patch_size_bits * 16)
-        patch_latents = self.patch_proj(x)  # [batch, num_patches, d_model]
-
-        # Patch padding mask: True where all bits in patch are PAD (value 2)
-        bit_patches = cipher_bits.view(batch_size, num_patches, self.patch_size_bits)
-        is_pad_patch = (bit_patches == 2).all(dim=-1)  # [batch, num_patches]
-        patch_padding_mask = is_pad_patch.unsqueeze(1).unsqueeze(2)
-
-        return patch_latents, patch_padding_mask
-
-
-class LocalByteEncoder(nn.Module):
-    """
-    Local Encoder for Plaintext Bytes:
-    Embeds raw bytes and groups them into patches of size patch_size_bytes,
-    projecting each patch into a latent representation of dimension d_model.
+class LocalEncoder(nn.Module):
+    """Local Encoder for Byte Latent Transformer.
+    Embeds raw bytes in patches of size patch_size (e.g. 9 bytes),
+    applies local self-attention, and pools with cross-attention to produce
+    one patch embedding per window.
     """
 
     def __init__(
         self,
-        patch_size_bytes: int = 4,
-        d_byte: int = 128,
         d_model: int = 256,
-        num_bytes: int = NUM_BYTE_CLASSES,
+        patch_size: int = 9,
+        d_local: int = 128,
+        num_heads: int = 4,
+        dropout: float = 0.1,
     ):
         super().__init__()
-        self.patch_size_bytes = patch_size_bytes
+        self.patch_size = patch_size
         self.d_model = d_model
-        self.byte_embedding = nn.Embedding(num_bytes, d_byte, padding_idx=PAD_BYTE_ID)
-        self.patch_proj = nn.Sequential(
-            nn.Linear(patch_size_bytes * d_byte, d_model),
-            LayerNorm(d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-        )
+        self.d_local = d_local
 
-    def forward(self, byte_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        byte_seq: [batch, byte_len]
-        returns:
-            patch_latents: [batch, num_patches, d_model]
-            patch_padding_mask: [batch, 1, 1, num_patches]
-        """
-        batch_size, byte_len = byte_seq.shape
+        self.byte_embedding = nn.Embedding(BYTE_VOCAB_SIZE, d_local, padding_idx=BYTE_PAD)
+        self.byte_pos_enc = SinusoidalPositionalEncoding(d_local, max_len=patch_size, dropout=dropout)
 
-        # Pad byte_len to a multiple of patch_size_bytes if needed
-        rem = byte_len % self.patch_size_bytes
-        if rem != 0:
-            pad_amount = self.patch_size_bytes - rem
-            pad_tensor = torch.full(
-                (batch_size, pad_amount), PAD_BYTE_ID, dtype=torch.long, device=byte_seq.device
-            )
-            byte_seq = torch.cat([byte_seq, pad_tensor], dim=1)
-            byte_len = byte_seq.shape[1]
+        self.self_attn1 = MultiHeadAttention(d_local, num_heads, dropout)
+        self.self_attn_norm1 = LayerNorm(d_local)
+        self.self_attn_dropout1 = nn.Dropout(dropout)
 
-        num_patches = byte_len // self.patch_size_bytes
+        self.self_attn2 = MultiHeadAttention(d_local, num_heads, dropout)
+        self.self_attn_norm2 = LayerNorm(d_local)
+        self.self_attn_dropout2 = nn.Dropout(dropout)
 
-        # Embed each byte
-        x = self.byte_embedding(byte_seq)  # [batch, byte_len, d_byte]
-        # Reshape to patches
-        x = x.view(batch_size, num_patches, self.patch_size_bytes * x.size(-1))
-        patch_latents = self.patch_proj(x)  # [batch, num_patches, d_model]
+        self.pool_query = nn.Parameter(torch.randn(1, 1, d_local))
+        self.pool_attn = MultiHeadAttention(d_local, num_heads, dropout)
+        self.pool_norm = LayerNorm(d_local)
 
-        # Patch padding mask: True where all bytes in patch are PAD (0)
-        byte_patches = byte_seq.view(batch_size, num_patches, self.patch_size_bytes)
-        is_pad_patch = (byte_patches == PAD_BYTE_ID).all(dim=-1)
-        patch_padding_mask = is_pad_patch.unsqueeze(1).unsqueeze(2)
+        self.project = nn.Linear(d_local, d_model)
 
-        return patch_latents, patch_padding_mask
+    def forward(self, byte_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len = byte_ids.shape
 
+        bos_tok = byte_ids[:, :1]
+        content = byte_ids[:, 1:]
+        content_len = content.size(1)
 
-class LocalByteDecoder(nn.Module):
-    """
-    Local Decoder:
-    Expands each latent patch vector from the global transformer back into
-    patch_size_bytes individual byte predictions over 259 byte classes.
-    """
+        remainder = content_len % self.patch_size
+        if remainder != 0:
+            pad_len = self.patch_size - remainder
+            content = torch.nn.functional.pad(content, (0, pad_len), value=BYTE_PAD)
+            content_len = content.size(1)
 
-    def __init__(
-        self,
-        patch_size_bytes: int = 4,
-        d_model: int = 256,
-        d_byte: int = 128,
-        num_bytes: int = NUM_BYTE_CLASSES,
-    ):
-        super().__init__()
-        self.patch_size_bytes = patch_size_bytes
-        self.num_bytes = num_bytes
-        self.unpatch = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            LayerNorm(d_model),
-            nn.GELU(),
-            nn.Linear(d_model, patch_size_bytes * d_byte),
-        )
-        self.byte_head = nn.Linear(d_byte, num_bytes)
+        num_patches = content_len // self.patch_size
 
-    def forward(self, patch_latents: torch.Tensor) -> torch.Tensor:
-        """
-        patch_latents: [batch, num_patches, d_model]
-        returns:
-            byte_logits: [batch, num_patches * patch_size_bytes, num_bytes]
-        """
-        batch_size, num_patches, _ = patch_latents.shape
-        x = self.unpatch(patch_latents)  # [batch, num_patches, patch_size * d_byte]
-        x = x.view(batch_size, num_patches * self.patch_size_bytes, -1)
-        return self.byte_head(x)  # [batch, total_bytes, num_bytes]
+        patches = content.view(batch_size, num_patches, self.patch_size)
+        patch_pad_mask = (patches == BYTE_PAD).all(dim=-1)
+        patches_flat = patches.contiguous().view(batch_size * num_patches, self.patch_size)
+
+        pad_mask = patches_flat == BYTE_PAD
+        attn_mask = pad_mask.unsqueeze(1).unsqueeze(2).float() * -1e9
+
+        x = self.byte_embedding(patches_flat)
+        x = self.byte_pos_enc(x)
+
+        x_norm = self.self_attn_norm1(x)
+        x = x + self.self_attn_dropout1(self.self_attn1(x_norm, x_norm, x_norm, mask=attn_mask))
+        x_norm = self.self_attn_norm2(x)
+        x = x + self.self_attn_dropout2(self.self_attn2(x_norm, x_norm, x_norm, mask=attn_mask))
+
+        query = self.pool_query.expand(batch_size * num_patches, -1, -1)
+        x_norm = self.pool_norm(x)
+        pooled = self.pool_attn(query, x_norm, x_norm, mask=attn_mask)
+
+        patch_emb = self.project(pooled.squeeze(1))
+        patch_emb = patch_emb.view(batch_size, num_patches, self.d_model)
+
+        bos_emb = self.project(self.byte_embedding(bos_tok).squeeze(1)).unsqueeze(1)
+        patch_emb = torch.cat([bos_emb, patch_emb], dim=1)
+        bos_pad = torch.zeros(batch_size, 1, dtype=torch.bool, device=byte_ids.device)
+        patch_pad_mask = torch.cat([bos_pad, patch_pad_mask], dim=1)
+
+        return patch_emb, patch_pad_mask
 
 
-class ByteLatentTransformer(nn.Module):
-    """
-    Configuration 5 (C5): Byte Latent Transformer (Token-Free BLT).
-
-    - Local Cipher Encoder: Groups cipher bits into 32-bit patches -> latents.
-    - Local Plaintext Encoder: Groups bytes into 4-byte patches -> latents.
-    - Global Transformer: 2 Encoder layers, 2 Decoder layers with MHA, Pre-LN LayerNorm,
-      and Sinusoidal Positional Encodings (matching Table 1 C1 specs).
-    - Local Decoder: Projects output latents back to raw byte distributions.
-    """
+class BLTSeq2SeqModel(nn.Module):
+    """Byte Latent Transformer: LocalEncoder -> Global Enc/Dec -> Byte Projection."""
 
     def __init__(
         self,
         d_model: int = 256,
         num_heads: int = 8,
+        num_encoder_layers: int = 4,
+        num_decoder_layers: int = 4,
         d_ff: int = 1024,
-        num_layers: int = 2,
-        patch_size_bytes: int = 4,
-        d_byte: int = 128,
-        max_patches: int = 1024,
         dropout: float = 0.1,
+        max_seq_len: int = 512,
+        patch_size: int = 9,
+        d_local: int = 128,
+        local_heads: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
-        self.patch_size_bytes = patch_size_bytes
+        self.src_patch_size = patch_size
+        self.max_seq_len = max_seq_len
 
-        # Local Encoders & Decoders
-        self.local_cipher_encoder = LocalCipherEncoder(
-            patch_size_bytes=patch_size_bytes, d_model=d_model
-        )
-        self.local_byte_encoder = LocalByteEncoder(
-            patch_size_bytes=patch_size_bytes,
-            d_byte=d_byte,
-            d_model=d_model,
-        )
-        self.local_byte_decoder = LocalByteDecoder(
-            patch_size_bytes=patch_size_bytes,
-            d_model=d_model,
-            d_byte=d_byte,
-        )
+        self.local_encoder = LocalEncoder(d_model, self.src_patch_size, d_local, local_heads, dropout)
+        self.tgt_embedding = nn.Embedding(BYTE_VOCAB_SIZE, d_model, padding_idx=BYTE_PAD)
+        self.patch_pos_enc = SinusoidalPositionalEncoding(d_model, max_len=max_seq_len, dropout=dropout)
+        self.tgt_pos_enc = SinusoidalPositionalEncoding(d_model, max_len=max_seq_len, dropout=dropout)
 
-        # Positional Encodings in Latent Space (Sinusoidal, as required by Table 1)
-        self.encoder_pos = SinusoidalPositionalEncoding(
-            d_model=d_model, max_sequence_length=max_patches
-        )
-        self.decoder_pos = SinusoidalPositionalEncoding(
-            d_model=d_model, max_sequence_length=max_patches
-        )
+        self.encoder_layers = nn.ModuleList([
+            EncoderLayer(d_model, num_heads, d_ff, dropout, "mha", "layernorm", num_heads)
+            for _ in range(num_encoder_layers)
+        ])
+        self.decoder_layers = nn.ModuleList([
+            DecoderLayer(d_model, num_heads, d_ff, dropout, "mha", "layernorm", num_heads)
+            for _ in range(num_decoder_layers)
+        ])
 
-        # Global Transformer Encoder & Decoder (MHA, LayerNorm)
-        self.encoder_layers = nn.ModuleList(
-            [
-                EncoderLayer(
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    d_ff=d_ff,
-                    dropout=dropout,
-                    use_rope=False,
-                    norm_type="layernorm",
-                    attention_type="mha",
-                )
-                for _ in range(num_layers)
-            ]
-        )
         self.encoder_norm = LayerNorm(d_model)
-
-        self.decoder_layers = nn.ModuleList(
-            [
-                DecoderLayer(
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    d_ff=d_ff,
-                    dropout=dropout,
-                    use_rope=False,
-                    norm_type="layernorm",
-                    attention_type="mha",
-                )
-                for _ in range(num_layers)
-            ]
-        )
         self.decoder_norm = LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
 
-    def encode(
-        self, cipher_bits: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Runs local cipher patching and global transformer encoder."""
-        cipher_latents, cipher_mask = self.local_cipher_encoder(cipher_bits)
-        x = cipher_latents * math.sqrt(self.d_model)
-        x = self.encoder_pos(x)
-        x = self.dropout(x)
+        self.output_projection = nn.Linear(d_model, BYTE_VOCAB_SIZE)
+        self.embed_dropout = nn.Dropout(p=dropout)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+        with torch.no_grad():
+            self.tgt_embedding.weight[BYTE_PAD].zero_()
+            self.local_encoder.byte_embedding.weight[BYTE_PAD].zero_()
+
+    def _make_pad_mask(self, pad_mask: torch.Tensor) -> torch.Tensor:
+        return pad_mask.unsqueeze(1).unsqueeze(2).float() * -1e9
+
+    def _make_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        return mask.unsqueeze(0).unsqueeze(0).float() * -1e9
+
+    def encode(self, src_bytes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        patch_emb, patch_pad_mask = self.local_encoder(src_bytes)
+        patch_emb = self.patch_pos_enc(patch_emb)
+        src_mask = self._make_pad_mask(patch_pad_mask)
+        x = patch_emb
 
         for layer in self.encoder_layers:
-            x, _ = layer(x, padding_mask=cipher_mask)
-        x = self.encoder_norm(x)
-        return x, cipher_mask
+            x = layer(x, src_mask=src_mask)
+
+        return self.encoder_norm(x), patch_pad_mask
 
     def decode(
-        self,
-        decoder_bytes: torch.Tensor,
-        encoder_output: torch.Tensor,
-        cipher_mask: torch.Tensor,
+        self, tgt_bytes: torch.Tensor, enc_output: torch.Tensor, src_patch_pad_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Runs local byte patching, global transformer decoder, and local byte decoder."""
-        patch_latents, _ = self.local_byte_encoder(decoder_bytes)
-        num_patches = patch_latents.size(1)
-
-        x = patch_latents * math.sqrt(self.d_model)
-        x = self.decoder_pos(x)
-        x = self.dropout(x)
-
-        # Causal mask over latent patches
-        causal_mask = create_causal_mask(num_patches, x.device)
+        x = self.tgt_embedding(tgt_bytes) * math.sqrt(self.d_model)
+        x = self.tgt_pos_enc(x)
+        tgt_len = tgt_bytes.size(1)
+        tgt_pad_mask = tgt_bytes == BYTE_PAD
+        tgt_mask_pad = self._make_pad_mask(tgt_pad_mask)
+        tgt_mask_causal = self._make_causal_mask(tgt_len, tgt_bytes.device)
+        tgt_mask = tgt_mask_pad.expand(-1, -1, tgt_len, -1) + tgt_mask_causal
+        memory_mask = self._make_pad_mask(src_patch_pad_mask)
 
         for layer in self.decoder_layers:
-            x, _, _ = layer(
-                x,
-                encoder_output,
-                self_attention_mask=causal_mask,
-                cross_attention_mask=cipher_mask,
-            )
-        x = self.decoder_norm(x)
+            x = layer(x, enc_output, tgt_mask=tgt_mask, memory_mask=memory_mask)
 
-        # Local Decoder: expand patches back to raw byte distributions
-        byte_logits = self.local_byte_decoder(x)
-        return byte_logits
+        return self.decoder_norm(x)
 
-    def forward(
-        self, cipher: torch.Tensor, decoder_input: torch.Tensor, **kwargs
-    ) -> dict:
-        """
-        cipher: [batch, cipher_bits_len]
-        decoder_input: [batch, byte_seq_len]
-        returns:
-            dict with 'logits': [batch, num_decoded_bytes, NUM_BYTE_CLASSES]
-        """
-        enc_out, cipher_mask = self.encode(cipher)
-        logits = self.decode(decoder_input, enc_out, cipher_mask)
-        return {"logits": logits}
+    def forward(self, src_bytes: torch.Tensor, tgt_bytes: torch.Tensor) -> torch.Tensor:
+        enc_output, src_pad_mask = self.encode(src_bytes)
+        dec_output = self.decode(tgt_bytes, enc_output, src_pad_mask)
+        return self.output_projection(dec_output)
 
     @torch.no_grad()
-    def generate(
-        self,
-        cipher: torch.Tensor,
-        max_length_bytes: int = 400,
-        bos_byte_id: int = BOS_BYTE_ID,
-        eos_byte_id: int = EOS_BYTE_ID,
-        repetition_penalty: float = 1.0,
-        no_repeat_ngram_size: int = 0,
-    ) -> torch.Tensor:
-        """
-        Autoregressively generates text byte-by-byte (patch-by-patch).
-        cipher: [batch, cipher_bits_len]
-        returns:
-            generated_bytes: [batch, generated_byte_len]
-        """
-        self.eval()
-        batch_size = cipher.size(0)
-        device = cipher.device
+    def greedy_decode(self, src_bytes: torch.Tensor, max_len: int = 512) -> torch.Tensor:
+        batch_size = src_bytes.size(0)
+        device = src_bytes.device
 
-        enc_out, cipher_mask = self.encode(cipher)
-
-        # Start with [BOS] padded to one patch
-        init_bytes = [bos_byte_id] + [PAD_BYTE_ID] * (self.patch_size_bytes - 1)
-        generated = torch.tensor(
-            [init_bytes] * batch_size, dtype=torch.long, device=device
-        )
-
+        enc_output, src_pad_mask = self.encode(src_bytes)
+        ys = torch.full((batch_size, 1), BYTE_BOS, dtype=torch.long, device=device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        max_patches = max_length_bytes // self.patch_size_bytes
 
-        for _ in range(max_patches):
-            logits = self.decode(generated, enc_out, cipher_mask)
-            last_patch_logits = logits[:, -self.patch_size_bytes :, :]  # [batch, patch_size, 259]
-
-            if repetition_penalty > 1.0:
-                for b in range(batch_size):
-                    for prev_token in set(generated[b].tolist()):
-                        if last_patch_logits[b, :, prev_token].mean() < 0:
-                            last_patch_logits[b, :, prev_token] *= repetition_penalty
-                        else:
-                            last_patch_logits[b, :, prev_token] /= repetition_penalty
-
-            new_bytes = last_patch_logits.argmax(dim=-1)
-
-            for b in range(batch_size):
-                if eos_byte_id in new_bytes[b].tolist():
-                    finished[b] = True
-
-            generated = torch.cat([generated, new_bytes], dim=1)
+        for _ in range(max_len):
+            dec_output = self.decode(ys, enc_output, src_pad_mask)
+            logits = self.output_projection(dec_output[:, -1, :])
+            next_byte = logits.argmax(dim=-1)
+            next_byte = next_byte.masked_fill(finished, BYTE_EOS)
+            ys = torch.cat([ys, next_byte.unsqueeze(1)], dim=1)
+            finished = finished | (next_byte == BYTE_EOS)
             if finished.all():
                 break
 
-        return generated
+        return ys[:, 1:]

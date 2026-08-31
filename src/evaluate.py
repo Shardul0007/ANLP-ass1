@@ -1,405 +1,209 @@
 """
-Evaluation script for Configuration 1 (C1: Base Transformer).
-Generates predictions using greedy decoding and computes all required assignment metrics:
-1. Bit-Level Accuracy (%)
-2. Sequence Accuracy (%)
-3. Levenshtein Distance
-4. BLEU Score
-5. ROUGE Scores (ROUGE-1, ROUGE-2, ROUGE-L)
+Standalone Evaluation script for trained models (C1–C5).
+Loads a saved checkpoint, runs greedy autoregressive decoding on the test set,
+and computes all required assignment metrics.
 """
 
 import argparse
 import os
-from pathlib import Path
-
+import sys
 import torch
 
-from .dataset import BinaryToTextDataset
-from .models.transformer import BinaryToTextTransformer
-from .models.blt import ByteLatentTransformer, byte_ids_to_string, NUM_BYTE_CLASSES
-from .tokenizer import load_tokenizer
-from .training import split_dataset
-from .utils import compute_all_metrics, compute_levenshtein_distance
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.dataset import (
+    build_dataloaders,
+    BYTE_PAD,
+    PLAIN_CHUNK_SIZE,
+    DATASET_DIR,
+)
+from src.models import Seq2SeqTransformer
+from src.models.blt import BLTSeq2SeqModel
+from src.utils import compute_all_metrics, compute_naive_baselines
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate Transformer (C1-C5)")
+    parser = argparse.ArgumentParser(description="Evaluate Cipher Transformer")
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/c2_best.pt",
+        default="checkpoints/c1/best_model.pt",
         help="Path to checkpoint file",
     )
     parser.add_argument(
-        "--config",
+        "--run_name",
         type=str,
+        default="c1",
+        help="Run name / config tag",
+    )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
         default=None,
-        help="Model config (auto-detected if None)",
+        help="Number of test samples to evaluate (default: all)",
     )
-    parser.add_argument(
-        "--num_examples",
-        type=int,
-        default=50,
-        help="Number of validation examples to evaluate (or -1 for all)",
-    )
-    parser.add_argument(
-        "--max_cipher_len",
-        type=int,
-        default=8192,
-        help="Max cipher length in bits",
-    )
-    parser.add_argument(
-        "--max_gen_len",
-        type=int,
-        default=300,
-        help="Maximum generation length in tokens",
-    )
-    parser.add_argument(
-        "--repetition_penalty",
-        type=float,
-        default=1.0,
-        help="Repetition penalty for greedy decoding (1.0 = standard greedy)",
-    )
-    parser.add_argument(
-        "--no_repeat_ngram_size",
-        type=int,
-        default=0,
-        help="Block repeating n-grams of this size (0 = off, 3 = recommended)",
-    )
-    parser.add_argument(
-        "--d_model", type=int, default=256, help="Model hidden dimension"
-    )
-    parser.add_argument(
-        "--num_heads", type=int, default=8, help="Number of attention heads"
-    )
-    parser.add_argument(
-        "--d_ff", type=int, default=1024, help="FFN dimension"
-    )
-    parser.add_argument(
-        "--num_layers", type=int, default=2, help="Number of layers"
-    )
-    parser.add_argument(
-        "--output_file",
-        type=str,
-        default=None,
-        help="Path to save evaluation summary",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-
+    parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
-
-
-def detect_dims_from_checkpoint(checkpoint):
-    state_dict = checkpoint["model_state_dict"]
-
-    is_blt = "local_byte_encoder.byte_embedding.weight" in state_dict
-    if is_blt:
-        d_model = 256
-        vocab_size = NUM_BYTE_CLASSES
-        num_layers = 2
-        d_ff = 1024
-        max_cipher_len = 8192
-        max_text_len = 1024
-        pos_encoding = "sinusoidal"
-        attention_type = "mha"
-        norm_type = "layernorm"
-        return (
-            d_model,
-            vocab_size,
-            num_layers,
-            d_ff,
-            max_cipher_len,
-            max_text_len,
-            pos_encoding,
-            attention_type,
-            norm_type,
-            is_blt,
-        )
-
-    d_model = state_dict["output_projection.weight"].shape[1]
-    vocab_size = state_dict["output_projection.weight"].shape[0]
-    num_layers = sum(
-        1
-        for k in state_dict
-        if k.startswith("encoder.layers.") and k.endswith(".norm1.gamma")
-    )
-
-    d_ff = 1024
-    if "encoder.layers.0.ffn.linear1.weight" in state_dict:
-        d_ff = state_dict["encoder.layers.0.ffn.linear1.weight"].shape[0]
-
-    max_cipher_len = 8192
-    if "encoder_position.positional_encoding" in state_dict:
-        max_cipher_len = state_dict[
-            "encoder_position.positional_encoding"
-        ].shape[1]
-
-    max_text_len = 1024
-    if "decoder_position.positional_encoding" in state_dict:
-        max_text_len = state_dict[
-            "decoder_position.positional_encoding"
-        ].shape[1]
-
-    # Detect ablation settings
-    has_sinusoidal = "encoder_position.positional_encoding" in state_dict
-    pos_encoding = "sinusoidal" if has_sinusoidal else "rope"
-
-    is_rmsnorm = "encoder_norm.gamma" in state_dict and "encoder_norm.beta" not in state_dict
-    norm_type = "rmsnorm" if is_rmsnorm else "layernorm"
-
-    is_gqa = any(
-        "k_projection.weight" in k and state_dict[k].shape[0] != d_model
-        for k in state_dict
-    )
-    attention_type = "gqa" if is_gqa else "mha"
-
-    return (
-        d_model,
-        vocab_size,
-        num_layers,
-        d_ff,
-        max_cipher_len,
-        max_text_len,
-        pos_encoding,
-        attention_type,
-        norm_type,
-        is_blt,
-    )
 
 
 def main():
     args = parse_args()
+    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    if not os.path.exists(args.checkpoint):
+        raise FileNotFoundError(f"Checkpoint not found at: {args.checkpoint}")
 
-    tokenizer = load_tokenizer()
-    bos_id = tokenizer.token_to_id("[BOS]")
-    eos_id = tokenizer.token_to_id("[EOS]")
+    print(f"Loading checkpoint from: {args.checkpoint}")
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    config = ckpt.get("config", {})
 
-    # Checkpoint path check
-    checkpoint_path = args.checkpoint
-    if not os.path.exists(checkpoint_path):
-        fallback = "checkpoints/c1_epoch_1.pt"
-        if os.path.exists(fallback):
-            print(f"Notice: {checkpoint_path} not found. Falling back to {fallback}")
-            checkpoint_path = fallback
-        else:
-            raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
+    tokenization = config.get("tokenization", "subword")
+    is_blt = tokenization == "blt"
 
-    print(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    print(f"Config: {config.get('run_name', args.run_name)}")
+    print(f"Tokenization: {tokenization}")
 
-    # Detect dimensions and ablation architecture if possible
-    try:
-        (
-            d_model,
-            vocab_size,
-            num_layers,
-            d_ff,
-            max_cipher_len,
-            max_text_len,
-            pos_encoding,
-            attention_type,
-            norm_type,
-            is_blt,
-        ) = detect_dims_from_checkpoint(checkpoint)
-        print(
-            f"Detected from checkpoint: d_model={d_model}, d_ff={d_ff}, "
-            f"vocab={vocab_size}, layers={num_layers}, "
-            f"pos_encoding={pos_encoding}, attention={attention_type}, norm={norm_type}, "
-            f"max_cipher_len={max_cipher_len}, max_text_len={max_text_len}, is_blt={is_blt}"
-        )
-    except Exception:
-        d_model = args.d_model
-        d_ff = args.d_ff
-        vocab_size = tokenizer.get_vocab_size()
-        num_layers = args.num_layers
-        max_cipher_len = args.max_cipher_len
-        max_text_len = args.max_text_len
-        is_blt = (args.config and args.config.lower() == "c5")
-        pos_encoding = "rope" if (args.config and args.config.lower() == "c2") else "sinusoidal"
-        attention_type = "gqa" if (args.config and args.config.lower() == "c3") else "mha"
-        norm_type = "rmsnorm" if (args.config and args.config.lower() == "c4") else "layernorm"
-
-    # Determine config tag for reporting
-    if is_blt:
-        tag = "C5: BLT"
-        cfg_name = "c5"
-    elif pos_encoding == "rope":
-        tag = "C2: RoPE"
-        cfg_name = "c2"
-    elif attention_type == "gqa":
-        tag = "C3: GQA"
-        cfg_name = "c3"
-    elif norm_type == "rmsnorm":
-        tag = "C4: RMSNorm"
-        cfg_name = "c4"
-    else:
-        tag = "C1: Baseline"
-        cfg_name = "c1"
-
-    output_file = args.output_file or f"outputs/{cfg_name}_eval_results.txt"
-
-    # Load validation dataset
-    dataset = BinaryToTextDataset(
-        "data/brown_cipher.txt",
-        "data/brown_plain.txt",
-        max_cipher_len=max_cipher_len,
-        token_free=is_blt,
+    # Build dataset
+    data_info = build_dataloaders(
+        tokenization=tokenization,
+        batch_size=config.get("batch_size", 64),
+        max_seq_len=config.get("max_seq_len", 512),
+        vocab_size=config.get("bpe_vocab_size", 8000),
+        seed=config.get("seed", 42),
+        data_dir=DATASET_DIR,
     )
+    test_loader = data_info["test_loader"]
 
-    _, val_dataset = split_dataset(dataset, train_ratio=0.9, seed=args.seed)
-    total_val = len(val_dataset)
-    eval_count = total_val if args.num_examples < 0 else min(args.num_examples, total_val)
-
-    print(f"Total validation examples: {total_val} | Evaluating: {eval_count}")
-
-    # Initialize model
+    # Build model
     if is_blt:
-        model = ByteLatentTransformer(
-            d_model=d_model,
-            num_heads=args.num_heads,
-            d_ff=d_ff,
-            num_layers=num_layers,
-            patch_size_bytes=4,
-        ).to(device)
-        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        model = BLTSeq2SeqModel(
+            d_model=config.get("d_model", 256),
+            num_heads=config.get("num_heads", 8),
+            num_encoder_layers=config.get("num_encoder_layers", 4),
+            num_decoder_layers=config.get("num_decoder_layers", 4),
+            d_ff=config.get("d_ff", 1024),
+            dropout=config.get("dropout", 0.1),
+            max_seq_len=config.get("max_seq_len", 512),
+            patch_size=config.get("blt_patch_size", 9),
+            d_local=config.get("d_model", 256),
+            local_heads=config.get("num_heads", 8),
+        )
     else:
-        model = BinaryToTextTransformer(
-            vocab_size=vocab_size,
-            d_model=d_model,
-            num_heads=args.num_heads,
-            d_ff=d_ff,
-            num_layers=num_layers,
-            max_cipher_length=max_cipher_len,
-            max_text_length=max_text_len,
-            pos_encoding=pos_encoding,
-            attention_type=attention_type,
-            norm_type=norm_type,
-        ).to(device)
+        model = Seq2SeqTransformer(
+            src_vocab_size=data_info["src_vocab_size"],
+            tgt_vocab_size=data_info["tgt_vocab_size"],
+            d_model=config.get("d_model", 256),
+            num_heads=config.get("num_heads", 8),
+            num_encoder_layers=config.get("num_encoder_layers", 4),
+            num_decoder_layers=config.get("num_decoder_layers", 4),
+            d_ff=config.get("d_ff", 1024),
+            dropout=config.get("dropout", 0.1),
+            max_seq_len=config.get("max_seq_len", 512),
+            pad_idx=data_info["pad_idx"],
+            attention_type=config.get("attention_type", "mha"),
+            norm_type=config.get("norm_type", "layernorm"),
+            positional_encoding=config.get("positional_encoding", "sinusoidal"),
+            num_kv_heads=config.get("gqa_kv_heads", 2),
+        )
 
-        # Load weights with shape-safe filtering
-        model_state = model.state_dict()
-        filtered_state = {}
-        for k, v in checkpoint["model_state_dict"].items():
-            if k in model_state:
-                if model_state[k].shape == v.shape:
-                    filtered_state[k] = v
-                elif (
-                    k == "binary_embedding.weight"
-                    and v.shape[0] == 2
-                    and model_state[k].shape[0] == 3
-                    and v.shape[1] == model_state[k].shape[1]
-                ):
-                    model_state[k][:2] = v
-                    filtered_state[k] = model_state[k]
-
-        model.load_state_dict(filtered_state, strict=False)
-
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.to(device)
     model.eval()
 
-    epoch = checkpoint.get("epoch", "N/A")
-    val_loss = checkpoint.get("validation_loss", "N/A")
-    print(f"Model loaded (Configuration: {tag}, Trained Epoch: {epoch}, Val Loss: {val_loss})")
-
-    targets = []
+    print("\nRunning greedy decoding on test set...")
     predictions = []
+    targets = []
+    tokenizer_tgt = data_info.get("tokenizer_tgt")
 
-    print("\nRunning greedy decoding...")
-    for i in range(eval_count):
-        item = val_dataset[i]
-        cipher = item["cipher"].unsqueeze(0).to(device)
+    with torch.no_grad():
+        for batch in test_loader:
+            src, tgt = batch
+            src = src.to(device)
+            tgt = tgt.to(device)
 
-        if "plain_text" in item:
-            ref_text = item["plain_text"]
-        else:
-            tgt_ids = item["target"].tolist()
-            tgt_ids = [t for t in tgt_ids if t not in (0, eos_id)]
-            ref_text = tokenizer.decode(tgt_ids) if tokenizer else ""
+            if is_blt:
+                pred_ids = model.greedy_decode(src, max_len=PLAIN_CHUNK_SIZE + 16)
+            else:
+                pred_ids = model.greedy_decode(
+                    src,
+                    bos_idx=data_info["bos_idx"],
+                    eos_idx=data_info["eos_idx"],
+                    max_len=config.get("max_seq_len", 512),
+                )
 
-        if is_blt:
-            gen_tokens = model.generate(
-                cipher=cipher,
-                max_length_bytes=args.max_gen_len,
-                repetition_penalty=args.repetition_penalty,
-                no_repeat_ngram_size=args.no_repeat_ngram_size,
-            )
-            gen_ids = gen_tokens[0].detach().cpu().tolist()
-            pred_text = byte_ids_to_string(gen_ids)
-        else:
-            gen_tokens = model.generate(
-                cipher=cipher,
-                bos_token_id=bos_id,
-                eos_token_id=eos_id,
-                max_length=args.max_gen_len,
-                repetition_penalty=args.repetition_penalty,
-                no_repeat_ngram_size=args.no_repeat_ngram_size,
-            )
+            for i in range(pred_ids.size(0)):
+                pred_seq = pred_ids[i].cpu().tolist()
+                tgt_seq = tgt[i].cpu().tolist()
 
-            gen_ids = gen_tokens[0].detach().cpu().tolist()
-            if gen_ids and gen_ids[0] == bos_id:
-                gen_ids = gen_ids[1:]
-            if eos_id in gen_ids:
-                gen_ids = gen_ids[: gen_ids.index(eos_id)]
+                if is_blt:
+                    pred_str = bytes([b for b in pred_seq if b < 256 and b != BYTE_PAD]).decode(
+                        "utf-8", errors="replace"
+                    )
+                    tgt_str = bytes([b for b in tgt_seq if b < 256 and b != BYTE_PAD]).decode(
+                        "utf-8", errors="replace"
+                    )
+                else:
+                    eos_id = data_info["eos_idx"]
+                    pad_id = data_info["pad_idx"]
+                    bos_id = data_info["bos_idx"]
 
-            pred_text = tokenizer.decode(gen_ids)
+                    if eos_id in pred_seq:
+                        pred_seq = pred_seq[: pred_seq.index(eos_id)]
+                    pred_seq = [t for t in pred_seq if t not in (pad_id, bos_id, eos_id)]
 
-        targets.append(ref_text)
-        predictions.append(pred_text)
+                    if eos_id in tgt_seq:
+                        tgt_seq = tgt_seq[: tgt_seq.index(eos_id)]
+                    tgt_seq = [t for t in tgt_seq if t not in (pad_id, bos_id, eos_id)]
 
-        if (i + 1) % 10 == 0 or (i + 1) == eval_count:
-            print(f"Processed {i + 1:3d}/{eval_count} examples...")
+                    pred_str = tokenizer_tgt.decode(pred_seq) if pred_seq else ""
+                    tgt_str = tokenizer_tgt.decode(tgt_seq) if tgt_seq else ""
 
-    # Compute metrics
-    print("\nComputing evaluation metrics...")
-    metrics = compute_all_metrics(targets, predictions)
+                predictions.append(pred_str)
+                targets.append(tgt_str)
 
-    # Print Report
-    header = "=" * 70
-    output_lines = [
-        header,
-        f"CONFIGURATION {tag.upper()} EVALUATION REPORT",
-        header,
-        f"Checkpoint:            {checkpoint_path}",
-        f"Evaluated Examples:    {eval_count}",
-        f"Bit-Level Accuracy:    {metrics['bit_accuracy'] * 100:.2f}%",
-        f"Sequence Accuracy:     {metrics['sequence_accuracy'] * 100:.2f}%",
-        f"Levenshtein Distance:  {metrics['levenshtein_distance']:.2f}",
-        f"BLEU Score:            {metrics['bleu'] * 100:.2f}",
-        f"ROUGE-1:               {metrics['rouge1']:.4f}",
-        f"ROUGE-2:               {metrics['rouge2']:.4f}",
-        f"ROUGE-L:               {metrics['rougeL']:.4f}",
-        header,
-        "\nQUALITATIVE SAMPLES (First 3 Examples):",
-        header,
-    ]
+                if args.num_samples and len(predictions) >= args.num_samples:
+                    break
+            if args.num_samples and len(predictions) >= args.num_samples:
+                break
 
+    metrics = compute_all_metrics(predictions, targets, is_token_free=is_blt)
+
+    train_targets = data_info["splits"]["train"]["plain"]
+    test_targets = data_info["splits"]["test"]["plain"]
+    baselines = compute_naive_baselines(train_targets, test_targets)
+
+    print("\n" + "=" * 60)
+    print(f"EVALUATION REPORT — {args.run_name.upper()}")
+    print("=" * 60)
+    print(f"Evaluated Samples:     {len(predictions)}")
+    print(f"Bit-Level Accuracy:    {metrics.get('bit_accuracy', 0.0) * 100:.2f}%")
+    print(f"Sequence Accuracy:     {metrics.get('sequence_accuracy', 0.0) * 100:.2f}%")
+    print(f"Levenshtein (Norm):    {metrics.get('levenshtein_normalized', 0.0):.4f}")
+    print(f"Levenshtein (Raw):     {metrics.get('levenshtein_raw', 0.0):.2f}")
+    if not is_blt:
+        print(f"BLEU Score:            {metrics.get('bleu', 0.0):.2f}")
+        print(f"ROUGE-1:               {metrics.get('rouge1', 0.0):.4f}")
+        print(f"ROUGE-2:               {metrics.get('rouge2', 0.0):.4f}")
+        print(f"ROUGE-L:               {metrics.get('rougeL', 0.0):.4f}")
+    print("=" * 60)
+
+    if baselines:
+        print("\nNAIVE BASELINES:")
+        if "baseline_a" in baselines:
+            ba = baselines["baseline_a"]
+            print(f"  Most Frequent Byte: Bit Acc = {ba['bit_accuracy'] * 100:.2f}%, Seq Acc = {ba['sequence_accuracy'] * 100:.2f}%")
+        if "baseline_b" in baselines:
+            bb = baselines["baseline_b"]
+            print(f"  Unigram Sample:     Bit Acc = {bb['bit_accuracy'] * 100:.2f}%, Seq Acc = {bb['sequence_accuracy'] * 100:.2f}%")
+
+    print("\nSAMPLE PREDICTIONS (First 3):")
     for idx in range(min(3, len(targets))):
-        output_lines.extend(
-            [
-                f"\n[Sample {idx + 1}]",
-                f"TARGET:     {targets[idx]}",
-                f"PREDICTION: {predictions[idx]}",
-                f"Levenshtein Dist: {compute_levenshtein_distance(targets[idx], predictions[idx])}",
-            ]
-        )
-
-    output_lines.append(header)
-    summary_text = "\n".join(output_lines)
-    safe_summary = summary_text.encode("ascii", errors="replace").decode("ascii")
-    print("\n" + safe_summary)
-
-    # Save to outputs
-    os.makedirs(Path(output_file).parent, exist_ok=True)
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write(summary_text)
-
-    print(f"\nResults saved to: {output_file}")
+        print(f"\n[Sample {idx + 1}]")
+        print(f"TARGET:     {targets[idx]}")
+        print(f"PREDICTION: {predictions[idx]}")
 
 
 if __name__ == "__main__":
-    from .utils import levenshtein_distance
     main()
