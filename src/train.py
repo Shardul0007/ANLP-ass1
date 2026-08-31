@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Main training script — trains a Seq2SeqTransformer (C1–C4) or BLTSeq2SeqModel (C5)
 on the cipher decryption task.

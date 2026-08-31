@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Standalone Evaluation script for trained models (C1–C5).
 Loads a saved checkpoint, runs greedy autoregressive decoding on the test set,

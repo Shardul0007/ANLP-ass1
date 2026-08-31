@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import os
 import json
 import collections
 import random
 import math
-from typing import Optional
+from typing import Optional, Dict, List, Tuple, Union, Any
 
 import torch
 import numpy as np
@@ -44,7 +46,7 @@ except ImportError:
 # W&B Helpers
 # ==============================================================================
 
-def init_wandb(project: str, config: dict, name: str | None = None):
+def init_wandb(project: str, config: dict, name: Optional[str] = None) -> Any:
     if wandb is not None:
         try:
             return wandb.init(project=project, config=config, name=name)
@@ -55,7 +57,7 @@ def init_wandb(project: str, config: dict, name: str | None = None):
     return DummyRun()
 
 
-def log_wandb(metrics: dict, step: int | None = None) -> None:
+def log_wandb(metrics: dict, step: Optional[int] = None) -> None:
     if wandb is not None and wandb.run is not None:
         try:
             wandb.log(metrics, step=step)
@@ -78,8 +80,8 @@ def finish_wandb() -> None:
 def push_to_hub(
     path: str,
     repo_id: str,
-    path_in_repo: str | None = None,
-    token: str | None = None,
+    path_in_repo: Optional[str] = None,
+    token: Optional[str] = None,
 ) -> str:
     token = token or os.environ.get("HF_TOKEN")
     if HfApi is None:
@@ -97,7 +99,7 @@ def push_to_hub(
 def push_folder_to_hub(
     folder_path: str,
     repo_id: str,
-    token: str | None = None,
+    token: Optional[str] = None,
 ) -> str:
     token = token or os.environ.get("HF_TOKEN")
     if HfApi is None:
@@ -115,7 +117,7 @@ def pull_from_hub(
     repo_id: str,
     filename: str,
     local_dir: str = "checkpoints",
-    token: str | None = None,
+    token: Optional[str] = None,
 ) -> str:
     token = token or os.environ.get("HF_TOKEN")
     if hf_hub_download is None:
@@ -133,7 +135,7 @@ def save_and_push(
     repo_id: str,
     filename: str = "model.pt",
     local_dir: str = "checkpoints",
-    token: str | None = None,
+    token: Optional[str] = None,
 ) -> str:
     os.makedirs(local_dir, exist_ok=True)
     local_path = os.path.join(local_dir, filename)
@@ -147,7 +149,7 @@ def load_from_hub(
     filename: str = "model.pt",
     local_dir: str = "checkpoints",
     device: str = "cpu",
-    token: str | None = None,
+    token: Optional[str] = None,
 ) -> torch.nn.Module:
     path = pull_from_hub(repo_id, filename, local_dir, token)
     state_dict = torch.load(path, map_location=device, weights_only=True)
@@ -159,13 +161,13 @@ def load_from_hub(
 # Evaluation Metrics
 # ==============================================================================
 
-def _str_to_bytes(s: str) -> bytes:
+def _str_to_bytes(s: Union[str, bytes]) -> bytes:
     if isinstance(s, bytes):
         return s
     return s.encode("utf-8")
 
 
-def _bytes_to_bits(b: bytes) -> list[int]:
+def _bytes_to_bits(b: bytes) -> List[int]:
     bits = []
     for byte in b:
         for i in range(7, -1, -1):
@@ -173,7 +175,7 @@ def _bytes_to_bits(b: bytes) -> list[int]:
     return bits
 
 
-def bit_level_accuracy(predictions: list[str], targets: list[str]) -> float:
+def bit_level_accuracy(predictions: List[str], targets: List[str]) -> float:
     """Bit-Level Accuracy.
     Convert both to raw bytes, right-pad shorter with zero bytes,
     expand each byte to 8 bits, and report % matching bits.
@@ -198,7 +200,7 @@ def bit_level_accuracy(predictions: list[str], targets: list[str]) -> float:
     return matching_bits / total_bits if total_bits > 0 else 0.0
 
 
-def sequence_accuracy(predictions: list[str], targets: list[str]) -> float:
+def sequence_accuracy(predictions: List[str], targets: List[str]) -> float:
     """Sequence Accuracy: % of pairs that are an exact match."""
     if not predictions:
         return 0.0
@@ -206,7 +208,7 @@ def sequence_accuracy(predictions: list[str], targets: list[str]) -> float:
     return exact / len(predictions)
 
 
-def _native_levenshtein(s1, s2) -> int:
+def _native_levenshtein(s1: Union[str, List[int]], s2: Union[str, List[int]]) -> int:
     if len(s1) < len(s2):
         s1, s2 = s2, s1
     if len(s2) == 0:
@@ -224,10 +226,10 @@ def _native_levenshtein(s1, s2) -> int:
 
 
 def levenshtein_metrics(
-    predictions: list[str],
-    targets: list[str],
+    predictions: List[str],
+    targets: List[str],
     byte_level: bool = False,
-) -> dict:
+) -> Dict[str, float]:
     """Levenshtein Distance metrics (raw and length-normalized)."""
     total_raw = 0.0
     total_norm = 0.0
@@ -256,7 +258,7 @@ def levenshtein_metrics(
     }
 
 
-def compute_bleu(predictions: list[str], targets: list[str]) -> float:
+def compute_bleu(predictions: List[str], targets: List[str]) -> float:
     """BLEU score using sacrebleu with native fallback."""
     if sacrebleu is not None:
         bleu = sacrebleu.corpus_bleu(predictions, [targets])
@@ -288,7 +290,7 @@ def compute_bleu(predictions: list[str], targets: list[str]) -> float:
     return sum(scores) / len(scores) if scores else 0.0
 
 
-def compute_rouge(predictions: list[str], targets: list[str]) -> dict:
+def compute_rouge(predictions: List[str], targets: List[str]) -> Dict[str, float]:
     """ROUGE-1/2/L using rouge-score with native fallback."""
     if rouge_scorer is not None:
         scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
@@ -352,7 +354,7 @@ def compute_rouge(predictions: list[str], targets: list[str]) -> dict:
     }
 
 
-def compute_naive_baselines(train_targets: list[str], test_targets: list[str]) -> dict:
+def compute_naive_baselines(train_targets: List[str], test_targets: List[str]) -> dict:
     """Compute baselines on raw text before evaluating."""
     if not train_targets or not test_targets:
         return {}
@@ -396,8 +398,8 @@ def compute_naive_baselines(train_targets: list[str], test_targets: list[str]) -
 
 
 def compute_all_metrics(
-    predictions: list[str],
-    targets: list[str],
+    predictions: List[str],
+    targets: List[str],
     is_token_free: bool = False,
 ) -> dict:
     """Compute all evaluation metrics for a set of predictions."""

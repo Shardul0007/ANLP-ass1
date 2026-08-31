@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Main orchestrator for the Cipher Transformer Ablation Study.
 Runs configurations C1 through C5 sequentially, generates plots, and creates the README.

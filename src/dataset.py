@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import os
 import json
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 import random
 
 import torch
@@ -41,8 +43,8 @@ BYTE_VOCAB_SIZE = 259
 
 
 def chunk_dataset(
-    cipher_lines: list[str], plain_lines: list[str], plain_chunk_size: int = PLAIN_CHUNK_SIZE
-) -> tuple[list[str], list[str]]:
+    cipher_lines: List[str], plain_lines: List[str], plain_chunk_size: int = PLAIN_CHUNK_SIZE
+) -> Tuple[List[str], List[str]]:
     """Chunk dataset aligned by character.
     Each plaintext character corresponds to 8 cipher bits.
     Inserts a '|' separator after every 8 bits in the cipher chunk.
@@ -72,7 +74,7 @@ def chunk_dataset(
     return chunked_cipher, chunked_plain
 
 
-def load_raw_lines(data_dir: str) -> tuple[list[str], list[str]]:
+def load_raw_lines(data_dir: str) -> Tuple[List[str], List[str]]:
     cipher_path = os.path.join(data_dir, "brown_cipher.txt")
     plain_path = os.path.join(data_dir, "brown_plain.txt")
 
@@ -86,12 +88,12 @@ def load_raw_lines(data_dir: str) -> tuple[list[str], list[str]]:
 
 
 def split_data(
-    cipher_lines: list[str],
-    plain_lines: list[str],
+    cipher_lines: List[str],
+    plain_lines: List[str],
     seed: int = 42,
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
-) -> dict:
+) -> Dict[str, Dict[str, List[str]]]:
     """Split data into train/val/test with fixed seed (80/10/10)."""
     n = len(cipher_lines)
     indices = list(range(n))
@@ -131,7 +133,7 @@ def get_split_data_cached(data_dir: str, cache_dir: str, seed: int = 42) -> dict
     return splits
 
 
-def train_single_tokenizer(texts: list[str], vocab_size: int, save_path: str) -> Tokenizer:
+def train_single_tokenizer(texts: List[str], vocab_size: int, save_path: str) -> Tokenizer:
     if os.path.exists(save_path):
         return Tokenizer.from_file(save_path)
 
@@ -155,11 +157,11 @@ def train_single_tokenizer(texts: list[str], vocab_size: int, save_path: str) ->
 
 
 def train_bpe_tokenizers(
-    train_cipher: list[str],
-    train_plain: list[str],
+    train_cipher: List[str],
+    train_plain: List[str],
     vocab_size: int = 8000,
     cache_dir: str = CACHE_DIR,
-) -> tuple[Tokenizer, Tokenizer]:
+) -> Tuple[Tokenizer, Tokenizer]:
     """Train separate BPE tokenizers for source cipher and target plaintext."""
     os.makedirs(cache_dir, exist_ok=True)
     src_path = os.path.join(cache_dir, "bpe_tokenizer_src_v3.json")
@@ -170,7 +172,7 @@ def train_bpe_tokenizers(
     return src_tokenizer, tgt_tokenizer
 
 
-def get_bpe_special_ids(tokenizer: Tokenizer) -> dict:
+def get_bpe_special_ids(tokenizer: Tokenizer) -> Dict[str, int]:
     return {
         "pad": tokenizer.token_to_id(BPE_PAD),
         "bos": tokenizer.token_to_id(BPE_BOS),
@@ -186,8 +188,8 @@ class CipherDatasetTokenized(Dataset):
 
     def __init__(
         self,
-        cipher_lines: list[str],
-        plain_lines: list[str],
+        cipher_lines: List[str],
+        plain_lines: List[str],
         src_tokenizer: Tokenizer,
         tgt_tokenizer: Tokenizer,
         max_seq_len: int = 512,
@@ -201,7 +203,7 @@ class CipherDatasetTokenized(Dataset):
     def __len__(self) -> int:
         return len(self.cipher_lines)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         cipher = self.cipher_lines[idx]
         plain = self.plain_lines[idx]
 
@@ -222,8 +224,8 @@ class CipherDatasetTokenFree(Dataset):
 
     def __init__(
         self,
-        cipher_lines: list[str],
-        plain_lines: list[str],
+        cipher_lines: List[str],
+        plain_lines: List[str],
         max_byte_len: int = 2048,
     ):
         self.cipher_lines = cipher_lines
@@ -237,7 +239,7 @@ class CipherDatasetTokenFree(Dataset):
         byte_vals = list(s.encode("utf-8"))[: max_len - 2]
         return torch.tensor([BYTE_BOS] + byte_vals + [BYTE_EOS], dtype=torch.long)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         cipher = self.cipher_lines[idx]
         plain = self.plain_lines[idx]
 
@@ -246,7 +248,7 @@ class CipherDatasetTokenFree(Dataset):
         return src, tgt
 
 
-def collate_tokenized(batch: list[tuple[torch.Tensor, torch.Tensor]], pad_id: int = 0):
+def collate_tokenized(batch: List[Tuple[torch.Tensor, torch.Tensor]], pad_id: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pad sequences in a batch to the same length."""
     src_list, tgt_list = zip(*batch)
     src_max = max(s.size(0) for s in src_list)
@@ -262,7 +264,7 @@ def collate_tokenized(batch: list[tuple[torch.Tensor, torch.Tensor]], pad_id: in
     return src_batch, tgt_batch
 
 
-def collate_token_free(batch: list[tuple[torch.Tensor, torch.Tensor]]):
+def collate_token_free(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
     return collate_tokenized(batch, pad_id=BYTE_PAD)
 
 
