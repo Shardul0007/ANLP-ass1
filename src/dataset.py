@@ -126,7 +126,10 @@ def train_single_tokenizer(
     texts: List[str], vocab_size: int, save_path: str, is_cipher: bool = False
 ) -> BPETokenizer:
     if os.path.exists(save_path):
-        return BPETokenizer.from_file(save_path)
+        try:
+            return BPETokenizer.from_file(save_path)
+        except Exception:
+            pass
 
     tokenizer = BPETokenizer.train(texts, vocab_size=vocab_size, is_cipher=is_cipher)
     tokenizer.save(save_path)
@@ -141,8 +144,8 @@ def train_bpe_tokenizers(
 ) -> Tuple[BPETokenizer, BPETokenizer]:
     """Train separate from-scratch BPE tokenizers for source cipher and target plaintext."""
     os.makedirs(cache_dir, exist_ok=True)
-    src_path = os.path.join(cache_dir, "bpe_tokenizer_src_v3.json")
-    tgt_path = os.path.join(cache_dir, "bpe_tokenizer_tgt_v3.json")
+    src_path = os.path.join(cache_dir, "bpe_tokenizer_src_scratch_v4.json")
+    tgt_path = os.path.join(cache_dir, "bpe_tokenizer_tgt_scratch_v4.json")
     src_tokenizer = train_single_tokenizer(train_cipher, vocab_size, src_path, is_cipher=True)
     tgt_tokenizer = train_single_tokenizer(train_plain, vocab_size, tgt_path, is_cipher=False)
 
