@@ -9,12 +9,7 @@ import random
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
-from tokenizers.pre_tokenizers import ByteLevel
-from tokenizers.decoders import ByteLevel as ByteLevelDecoder
-from tokenizers.processors import TemplateProcessing
+from .tokenizer import BPETokenizer, BPE_PAD, BPE_BOS, BPE_EOS, BPE_UNK
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -28,12 +23,6 @@ CACHE_DIR = os.path.join(_PROJECT_ROOT, ".cache")
 
 PLAIN_CHUNK_SIZE = 128
 MIN_CHUNK_CHARS = 32
-
-# BPE special tokens
-BPE_PAD = "<pad>"
-BPE_BOS = "<bos>"
-BPE_EOS = "<eos>"
-BPE_UNK = "<unk>"
 
 # Byte-level (BLT) special tokens
 BYTE_PAD = 256
@@ -133,26 +122,14 @@ def get_split_data_cached(data_dir: str, cache_dir: str, seed: int = 42) -> dict
     return splits
 
 
-def train_single_tokenizer(texts: List[str], vocab_size: int, save_path: str) -> Tokenizer:
+def train_single_tokenizer(
+    texts: List[str], vocab_size: int, save_path: str, is_cipher: bool = False
+) -> BPETokenizer:
     if os.path.exists(save_path):
-        return Tokenizer.from_file(save_path)
+        return BPETokenizer.from_file(save_path)
 
-    tokenizer = Tokenizer(BPE(unk_token=BPE_UNK))
-    tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
-    tokenizer.decoder = ByteLevelDecoder()
-    trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=[BPE_PAD, BPE_BOS, BPE_EOS, BPE_UNK], show_progress=True)
-    tokenizer.train_from_iterator(texts, trainer=trainer)
-
-    bos_id = tokenizer.token_to_id(BPE_BOS)
-    eos_id = tokenizer.token_to_id(BPE_EOS)
-    tokenizer.post_processor = TemplateProcessing(
-        single=f"{BPE_BOS}:0 $A:0 {BPE_EOS}:0",
-        special_tokens=[(BPE_BOS, bos_id), (BPE_EOS, eos_id)],
-    )
-    pad_id = tokenizer.token_to_id(BPE_PAD)
-    tokenizer.enable_padding(pad_id=pad_id, pad_token=BPE_PAD)
+    tokenizer = BPETokenizer.train(texts, vocab_size=vocab_size, is_cipher=is_cipher)
     tokenizer.save(save_path)
-
     return tokenizer
 
 
@@ -161,18 +138,18 @@ def train_bpe_tokenizers(
     train_plain: List[str],
     vocab_size: int = 8000,
     cache_dir: str = CACHE_DIR,
-) -> Tuple[Tokenizer, Tokenizer]:
-    """Train separate BPE tokenizers for source cipher and target plaintext."""
+) -> Tuple[BPETokenizer, BPETokenizer]:
+    """Train separate from-scratch BPE tokenizers for source cipher and target plaintext."""
     os.makedirs(cache_dir, exist_ok=True)
     src_path = os.path.join(cache_dir, "bpe_tokenizer_src_v3.json")
     tgt_path = os.path.join(cache_dir, "bpe_tokenizer_tgt_v3.json")
-    src_tokenizer = train_single_tokenizer(train_cipher, vocab_size, src_path)
-    tgt_tokenizer = train_single_tokenizer(train_plain, vocab_size, tgt_path)
+    src_tokenizer = train_single_tokenizer(train_cipher, vocab_size, src_path, is_cipher=True)
+    tgt_tokenizer = train_single_tokenizer(train_plain, vocab_size, tgt_path, is_cipher=False)
 
     return src_tokenizer, tgt_tokenizer
 
 
-def get_bpe_special_ids(tokenizer: Tokenizer) -> Dict[str, int]:
+def get_bpe_special_ids(tokenizer: BPETokenizer) -> Dict[str, int]:
     return {
         "pad": tokenizer.token_to_id(BPE_PAD),
         "bos": tokenizer.token_to_id(BPE_BOS),
@@ -182,16 +159,16 @@ def get_bpe_special_ids(tokenizer: Tokenizer) -> Dict[str, int]:
 
 class CipherDatasetTokenized(Dataset):
     """Dataset for tokenized mode (C1–C4).
-    Source: BPE-tokenized cipher binary strings (with '|' separators).
-    Target: BPE-tokenized plaintext.
+    Source: from-scratch BPE-tokenized cipher binary strings (with '|' separators).
+    Target: from-scratch BPE-tokenized plaintext.
     """
 
     def __init__(
         self,
         cipher_lines: List[str],
         plain_lines: List[str],
-        src_tokenizer: Tokenizer,
-        tgt_tokenizer: Tokenizer,
+        src_tokenizer: BPETokenizer,
+        tgt_tokenizer: BPETokenizer,
         max_seq_len: int = 512,
     ):
         self.cipher_lines = cipher_lines

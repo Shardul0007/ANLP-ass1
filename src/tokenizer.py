@@ -1,68 +1,228 @@
-from pathlib import Path
+from __future__ import annotations
 
-from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.pre_tokenizers import Whitespace
-from tokenizers.trainers import BpeTrainer
+import os
+import json
+import collections
+from typing import Optional, List, Dict, Tuple, Set, Any
+
+# Special tokens
+BPE_PAD = "<pad>"
+BPE_BOS = "<bos>"
+BPE_EOS = "<eos>"
+BPE_UNK = "<unk>"
+DEFAULT_SPECIAL_TOKENS = [BPE_PAD, BPE_BOS, BPE_EOS, BPE_UNK]
 
 
-SPECIAL_TOKENS = [
-    "[PAD]",
-    "[UNK]",
-    "[BOS]",
-    "[EOS]",
-]
+class EncodedOutput:
+    """Wrapper holding encoded token IDs and tokens."""
+
+    def __init__(self, ids: List[int], tokens: List[str]):
+        self.ids = ids
+        self.tokens = tokens
+
+
+class BPETokenizer:
+    """Byte-Pair Encoding (BPE) Tokenizer implemented from scratch.
+
+    Zero third-party library dependencies (no tokenizers, tiktoken, or sentencepiece).
+    Learns subword merge rules from training corpus for both ciphertext and plaintext.
+    """
+
+    def __init__(
+        self,
+        vocab: Optional[Dict[str, int]] = None,
+        merges: Optional[List[Tuple[str, str]]] = None,
+        special_tokens: Optional[List[str]] = None,
+    ):
+        self.special_tokens = special_tokens or DEFAULT_SPECIAL_TOKENS
+        self.pad_token = BPE_PAD
+        self.bos_token = BPE_BOS
+        self.eos_token = BPE_EOS
+        self.unk_token = BPE_UNK
+
+        self.vocab: Dict[str, int] = vocab or {}
+        self.inv_vocab: Dict[int, str] = {v: k for k, v in self.vocab.items()}
+        self.merges: List[Tuple[str, str]] = merges or []
+        self.bpe_ranks: Dict[Tuple[str, str], int] = {
+            tuple(pair): i for i, pair in enumerate(self.merges)
+        }
+        self.cache: Dict[str, List[str]] = {}
+
+    @classmethod
+    def train(
+        cls,
+        texts: List[str],
+        vocab_size: int = 8000,
+        special_tokens: Optional[List[str]] = None,
+        min_freq: int = 2,
+        is_cipher: bool = False,
+    ) -> BPETokenizer:
+        """Train BPE merge rules on corpus from scratch."""
+        if special_tokens is None:
+            special_tokens = DEFAULT_SPECIAL_TOKENS
+
+        # 1. Word frequencies
+        word_counts: Dict[str, int] = collections.Counter()
+        for text in texts:
+            words = text.strip().split()
+            for w in words:
+                word_counts[w] += 1
+
+        # 2. Build initial vocabulary and character splits
+        vocab: Dict[str, int] = {tok: idx for idx, tok in enumerate(special_tokens)}
+        splits: Dict[str, List[str]] = {}
+
+        for w in word_counts:
+            symbols = list(w) + ["</w>"]
+            splits[w] = symbols
+            for char in symbols:
+                if char not in vocab:
+                    vocab[char] = len(vocab)
+
+        merges: List[Tuple[str, str]] = []
+        num_merges = vocab_size - len(vocab)
+
+        # 3. Iteratively find and merge the most frequent adjacent pair
+        for _ in range(max(0, num_merges)):
+            pairs: Dict[Tuple[str, str], int] = collections.Counter()
+            for w, freq in word_counts.items():
+                syms = splits[w]
+                for i in range(len(syms) - 1):
+                    pairs[(syms[i], syms[i + 1])] += freq
+
+            if not pairs:
+                break
+
+            best_pair = max(pairs, key=pairs.get)
+            if pairs[best_pair] < min_freq:
+                break
+
+            merged_symbol = "".join(best_pair)
+            merges.append(best_pair)
+            vocab[merged_symbol] = len(vocab)
+
+            # Update splits containing best_pair
+            new_splits: Dict[str, List[str]] = {}
+            for w, syms in splits.items():
+                if best_pair[0] not in syms:
+                    new_splits[w] = syms
+                    continue
+                new_syms = []
+                i = 0
+                while i < len(syms):
+                    if i < len(syms) - 1 and (syms[i], syms[i + 1]) == best_pair:
+                        new_syms.append(merged_symbol)
+                        i += 2
+                    else:
+                        new_syms.append(syms[i])
+                        i += 1
+                new_splits[w] = new_syms
+            splits = new_splits
+
+        return cls(vocab=vocab, merges=merges, special_tokens=special_tokens)
+
+    def _tokenize_word(self, word: str) -> List[str]:
+        if word in self.cache:
+            return self.cache[word]
+
+        split = list(word) + ["</w>"]
+        while len(split) > 1:
+            pairs = [(split[i], split[i + 1]) for i in range(len(split) - 1)]
+            candidate_pairs = [p for p in pairs if p in self.bpe_ranks]
+            if not candidate_pairs:
+                break
+
+            best_pair = min(candidate_pairs, key=lambda p: self.bpe_ranks[p])
+            merged_symbol = "".join(best_pair)
+
+            new_split = []
+            i = 0
+            while i < len(split):
+                if i < len(split) - 1 and (split[i], split[i + 1]) == best_pair:
+                    new_split.append(merged_symbol)
+                    i += 2
+                else:
+                    new_split.append(split[i])
+                    i += 1
+            split = new_split
+
+        self.cache[word] = split
+        return split
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> EncodedOutput:
+        """Encodes text to subword token IDs (with BOS and EOS added)."""
+        words = text.strip().split()
+        tokens = []
+        for w in words:
+            tokens.extend(self._tokenize_word(w))
+
+        unk_id = self.vocab.get(self.unk_token, 3)
+        ids = [self.vocab.get(tok, unk_id) for tok in tokens]
+
+        if add_special_tokens:
+            bos_id = self.vocab.get(self.bos_token, 1)
+            eos_id = self.vocab.get(self.eos_token, 2)
+            ids = [bos_id] + ids + [eos_id]
+
+        return EncodedOutput(ids, tokens)
+
+    def decode(self, ids: List[int]) -> str:
+        """Decodes token IDs back to a reconstructed string."""
+        special_ids = {
+            self.vocab.get(st) for st in self.special_tokens if st in self.vocab
+        }
+        tokens = []
+        for token_id in ids:
+            if token_id in special_ids:
+                continue
+            tok = self.inv_vocab.get(token_id, "")
+            tokens.append(tok)
+
+        text = "".join(tokens).replace("</w>", " ").strip()
+        return text
+
+    def get_vocab_size(self) -> int:
+        return len(self.vocab)
+
+    def token_to_id(self, token: str) -> Optional[int]:
+        return self.vocab.get(token, None)
+
+    def id_to_token(self, idx: int) -> Optional[str]:
+        return self.inv_vocab.get(idx, None)
+
+    def save(self, path: str) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        data = {
+            "special_tokens": self.special_tokens,
+            "vocab": self.vocab,
+            "merges": [list(pair) for pair in self.merges],
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    @classmethod
+    def from_file(cls, path: str) -> BPETokenizer:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        vocab = data["vocab"]
+        merges = [tuple(pair) for pair in data["merges"]]
+        special_tokens = data.get("special_tokens", DEFAULT_SPECIAL_TOKENS)
+        return cls(vocab=vocab, merges=merges, special_tokens=special_tokens)
 
 
 def train_tokenizer(
-    input_file="data/brown_plain.txt",
-    output_file="data/brown_tokenizer.json",
-    vocab_size=8000,
-):
-    tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
-
-    tokenizer.pre_tokenizer = Whitespace()
-
-    trainer = BpeTrainer(
-        vocab_size=vocab_size,
-        min_frequency=2,
-        special_tokens=SPECIAL_TOKENS,
-    )
-
-    tokenizer.train([input_file], trainer)
-
-    tokenizer.save(output_file)
-
-    print(f"Tokenizer saved to: {output_file}")
-    print(f"Vocabulary size: {tokenizer.get_vocab_size()}")
-
-    return tokenizer
+    input_file: str = "data/brown_plain.txt",
+    output_file: str = "data/brown_tokenizer.json",
+    vocab_size: int = 8000,
+) -> BPETokenizer:
+    with open(input_file, "r", encoding="utf-8") as f:
+        texts = [line.strip() for line in f if line.strip()]
+    tok = BPETokenizer.train(texts, vocab_size=vocab_size)
+    tok.save(output_file)
+    return tok
 
 
 def load_tokenizer(
-    tokenizer_file="data/brown_tokenizer.json",
-):
-    return Tokenizer.from_file(tokenizer_file)
-
-
-if __name__ == "__main__":
-    tokenizer = train_tokenizer()
-
-    test_text = (
-        "Robert Boulter is an English film television "
-        "and theatre actor"
-    )
-
-    encoded = tokenizer.encode(test_text)
-
-    print("\nOriginal:")
-    print(test_text)
-
-    print("\nTokens:")
-    print(encoded.tokens)
-
-    print("\nIDs:")
-    print(encoded.ids)
-
-    print("\nDecoded:")
-    print(tokenizer.decode(encoded.ids))
+    tokenizer_file: str = "data/brown_tokenizer.json",
+) -> BPETokenizer:
+    return BPETokenizer.from_file(tokenizer_file)
