@@ -1,0 +1,38 @@
+{
+  "run_name": "c5",
+  "positional_encoding": "sinusoidal",
+  "attention_type": "mha",
+  "norm_type": "layernorm",
+  "tokenization": "blt",
+  "bit_accuracy": 0.682489157319329,
+  "sequence_accuracy": 0.0,
+  "levenshtein_raw": 91.48873121869784,
+  "levenshtein_normalized": 0.7598321758400012,
+  "bleu": "N/A - token-free",
+  "rouge1": "N/A - token-free",
+  "rouge2": "N/A - token-free",
+  "rougeL": "N/A - token-free",
+  "best_val_loss": 2.0554854403783485,
+  "best_epoch": 50,
+  "num_params": 8430083,
+  "speed": {
+    "tokens_per_sec": 43048.5,
+    "bytes_per_sec": 430484.9,
+    "peak_memory_mb": 920.0,
+    "wall_time_per_epoch": 58.2
+  },
+  "baselines": {
+    "baseline_a": {
+      "bit_accuracy": 0.6614201212154834,
+      "sequence_accuracy": 0.0,
+      "levenshtein_raw": 100.0534223706177,
+      "levenshtein_normalized": 0.8317380919427361
+    },
+    "baseline_b": {
+      "bit_accuracy": 0.6740084497177649,
+      "sequence_accuracy": 0.0,
+      "levenshtein_raw": 100.51585976627713,
+      "levenshtein_normalized": 0.8361840804340469
+    }
+  }
+}

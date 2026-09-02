@@ -23,13 +23,18 @@ CONFIGS = [
 ]
 
 
-def run_training_configs():
+def run_training_configs(skip_if_done: bool = True):
     print("=" * 60)
     print("Starting Cipher Transformer Ablation Study")
     print("=" * 60)
 
     for config in CONFIGS:
         run_name = config["run_name"]
+        metrics_file = os.path.join(PROJECT_ROOT, "outputs", f"metrics_{run_name}.json")
+        if skip_if_done and os.path.exists(metrics_file):
+            print(f"{run_name.upper()} metrics already found in outputs/ — skipping re-training.")
+            continue
+
         args = config["args"]
         print(f"\nLaunching {run_name.upper()} training...")
         cmd = [sys.executable, os.path.join(PROJECT_ROOT, "src", "train.py"), "--run_name", run_name] + args
