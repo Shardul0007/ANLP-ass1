@@ -306,17 +306,18 @@ def build_dataloaders(
     else:
         raise ValueError(f"Unknown tokenization mode: {tokenization}")
 
+    use_pin_memory = torch.cuda.is_available()
     train_loader = DataLoader(
         datasets["train"], batch_size=batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True
+        collate_fn=collate_fn, num_workers=num_workers, pin_memory=use_pin_memory
     )
     val_loader = DataLoader(
         datasets["val"], batch_size=batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True
+        collate_fn=collate_fn, num_workers=num_workers, pin_memory=use_pin_memory
     )
     test_loader = DataLoader(
         datasets["test"], batch_size=batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True
+        collate_fn=collate_fn, num_workers=num_workers, pin_memory=use_pin_memory
     )
 
     return {
