@@ -101,7 +101,6 @@ print("Loaded C1 checkpoint successfully!")
 |   |-- metrics_c1.json ... metrics_c5.json
 |   `-- losses_c1.json ... losses_c5.json
 |-- requirements.txt         # Dependencies
-|-- main.py                  # Ablation study runner & report generator
 |-- README.md                # Reproduction guide & links
 `-- Report.pdf               # 6-page comprehensive technical report
 ```
@@ -133,7 +132,8 @@ python src/train.py --run_name c4 --norm_type rmsnorm
 python src/train.py --run_name c5 --tokenization blt
 ```
 
-### 3. Generate Complete Plots & Summary
+### 3. Evaluation & Testing
 ```bash
-python main.py
+# Evaluate any trained checkpoint using greedy decoding
+python src/evaluate.py --run_name c1
 ```
